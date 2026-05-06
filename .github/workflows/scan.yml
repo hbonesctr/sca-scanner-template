@@ -65,11 +65,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ github.ref_name }}
       
-      - name: Pull latest changes
+      - name: Sync with remote
         run: |
-          git config user.name "SCA Bot"
-          git config user.email "sca@actions"
-          git pull --rebase origin ${{ github.ref_name }}
+            git config user.name "SCA Bot"
+            git config user.email "sca@actions"
+            git fetch origin ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
       
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
@@ -161,11 +162,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ github.ref_name }}
       
-      - name: Pull latest changes
+      - name: Sync with remote
         run: |
           git config user.name "SCA Bot"
           git config user.email "sca@actions"
-          git pull --rebase origin ${{ github.ref_name }}
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
       
       - name: Snyk Security Scan
         uses: snyk/actions@master
@@ -232,11 +234,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ github.ref_name }}
       
-      - name: Pull all latest changes
+      - name: Sync with remote
         run: |
           git config user.name "SCA Bot"
           git config user.email "sca@actions"
-          git pull --rebase origin ${{ github.ref_name }}
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
       
       - name: Generate Report
         run: |
@@ -362,7 +365,8 @@ EOF
         run: |
           git config user.name "SCA Bot"
           git config user.email "sca@actions"
-          git pull --rebase origin ${{ github.ref_name }}
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
           git add reports/
           if git diff --cached --quiet; then
             echo "No changes to commit"
@@ -412,7 +416,8 @@ EOF
         run: |
           git config user.name "SCA Bot"
           git config user.email "sca@actions"
-          git pull --rebase origin ${{ github.ref_name }}
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
           git add customer-software/
           if git diff --cached --quiet; then
             echo "No changes to commit"
@@ -436,7 +441,8 @@ EOF
         run: |
           git config user.name "SCA Bot"
           git config user.email "sca@actions"
-          git pull --rebase origin ${{ github.ref_name }}
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
       
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
