@@ -228,14 +228,14 @@ jobs:
           fi
       
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: python, javascript
           # Tell CodeQL to scan the customer-code directory
           source-root: customer-code
       
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         continue-on-error: true
 
 ################################################################################
