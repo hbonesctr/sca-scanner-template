@@ -1,0 +1,47 @@
+################################################################################
+# Dependabot Configuration
+# Author: Hector L Bones
+# Purpose: Monitor GitHub Actions for security and version updates
+#
+# What it monitors:
+# - actions/checkout
+# - actions/upload-artifact
+# - actions/download-artifact
+# - snyk/actions
+# - anchore/sbom-action
+# - anchore/scan-action
+# - github/codeql-action
+# - returntocorp/semgrep-action
+# - softprops/action-gh-release
+################################################################################
+
+version: 2
+
+updates:
+  # Monitor GitHub Actions in workflow files
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    labels:
+      - "dependencies"
+      - "security"
+      - "automated"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    reviewers:
+      - "hbonesctr"  # Replace with your GitHub username
+    
+  # Monitor Docker images (Snyk container)
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+    labels:
+      - "dependencies"
+      - "docker"
