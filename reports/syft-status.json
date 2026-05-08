@@ -1,6 +1,6 @@
 {
-  "scanner": "grype",
-  "command": "grype dir:/tmp/extracted -o json",
+  "scanner": "syft",
+  "command": "syft dir:/tmp/extracted -o spdx-json",
   "download_exit_code": 0,
   "install_exit_code": 0,
   "scan_exit_code": 0
