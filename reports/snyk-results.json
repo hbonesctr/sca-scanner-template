@@ -1,7 +1,6 @@
 {
   "scanner": "snyk",
-  "command": "test --all-projects",
   "status": "NO_VALID_OUTPUT",
   "exit_code": 2,
-  "reason": "Snyk did not produce JSON output. Exit code 3 commonly means no supported projects were detected."
+  "reason": "snyk test did not produce JSON output. Exit code 3 usually means no supported projects detected."
 }

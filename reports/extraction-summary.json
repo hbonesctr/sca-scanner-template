@@ -1,15 +1,17 @@
 {
-  "source_directory": "/home/runner/work/sca-scanner-template/sca-scanner-template/customer-software",
-  "extraction_directory": "/tmp/extracted",
-  "zip_files_found": [
-    "pylibssh-1.4.0.zip"
+  "generated_utc": "2026-05-08T19:24:22.348483+00:00",
+  "source_dir": "customer-software",
+  "extracted_dir": "/tmp/extracted",
+  "zip_files": [
+    "customer-software/pylibssh-1.4.0.zip"
   ],
-  "zip_files_extracted": [
-    {
-      "zip": "pylibssh-1.4.0.zip",
-      "target": "/tmp/extracted/01-pylibssh-1.4.0"
-    }
-  ],
-  "non_zip_content_copied": true,
-  "errors": []
+  "copied_files_mode": false,
+  "rejected_entries": [],
+  "extracted_file_count": 123,
+  "manifest_candidates": [
+    "/tmp/extracted/pylibssh-1.4.0/build-scripts/manylinux-container-image/Dockerfile",
+    "/tmp/extracted/pylibssh-1.4.0/docs/requirements.txt",
+    "/tmp/extracted/pylibssh-1.4.0/pyproject.toml",
+    "/tmp/extracted/pylibssh-1.4.0/setup.cfg"
+  ]
 }

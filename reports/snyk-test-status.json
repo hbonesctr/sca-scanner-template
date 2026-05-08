@@ -1,6 +1,1 @@
-{
-  "scanner": "snyk",
-  "command": "test",
-  "all_projects_exit_code": "2",
-  "unmanaged_exit_code": "147"
-}
+{"scanner":"snyk","command":"test","status":"COMPLETED_WITH_EXIT_CODE","exit_code":2}
