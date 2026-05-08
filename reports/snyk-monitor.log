@@ -1,0 +1,14 @@
+
+ ERROR   Unspecified Error (SNYK-CLI-0000)
+                                                                                        
+                                                                                        
+           Monitoring /tmp/extracted...                                                 
+                                                                                        
+           Failed to get dependencies for all 1 potential projects.                     
+                                                                                        
+           /tmp/extracted/pylibssh-1.4.0/docs/requirements.txt:                         
+           Missing required packages                                                    
+
+Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-cli-0000 
+                                                                         
+ID:      urn:snyk:interaction:fff3f55b-4797-4985-b5d1-e8b69387008d 

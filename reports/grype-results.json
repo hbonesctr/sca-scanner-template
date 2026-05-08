@@ -1,0 +1,5 @@
+{
+  "scanner": "grype",
+  "status": "NO_VALID_OUTPUT",
+  "reason": "Grype did not produce a non-empty JSON file. Review workflow logs."
+}
