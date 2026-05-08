@@ -1,1 +1,1 @@
-{"scanner":"snyk","command":"monitor","status":"COMPLETED_WITH_EXIT_CODE","exit_code":2}
+{"scanner":"snyk","command":"monitor","status":"NOT_EXECUTED","reason":"Missing SNYK_TOKEN"}

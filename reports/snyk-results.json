@@ -1,6 +1,5 @@
 {
   "scanner": "snyk",
-  "status": "NO_VALID_OUTPUT",
-  "exit_code": 2,
-  "reason": "snyk test did not produce JSON output. Exit code 3 usually means no supported projects detected."
+  "status": "NOT_EXECUTED",
+  "reason": "Repository secret SNYK_TOKEN is not configured."
 }
