@@ -1,627 +1,776 @@
 ################################################################################
-# DoD-Compliant Software Composition Analysis (SCA) Scanner
-# 
-# Author: Hector L Bones
-# Organization: DoD Cybersecurity
-# Version: 1.2 - Production Ready with CodeQL Fix
-# Last Updated: May 7, 2026
+# DoD Security Scanner - ZIP-based Customer Software Workflow
+# Author: Hector L. Bones
+# Version: 2.0
+# Last Updated: 2026-05-08
 #
 # Purpose:
-# Automated security scanning workflow for validating open source software 
-# to meet Department of Defense compliance requirements.
+# - Accept customer-provided source packages under customer-software/
+# - Safely extract ZIP files into the GitHub Actions runner workspace
+# - Scan the extracted source with SBOM, SCA, and SAST tools
+# - Publish audit-ready outputs to reports/
 #
-# Changelog v1.2:
-# - NEW: CodeQL now scans customer code (copies to workspace)
-# - Fixed: Removed Snyk --severity-threshold to report all vulnerabilities
-# - Fixed: Added file verification to prevent "size >= 1" release errors
-# - Fixed: YAML syntax errors in report generation section
-# - Tested: ansible/pylibssh (34 dependencies, 3m 34s runtime)
+# Important design note:
+# - Files created under /tmp/extracted exist only during workflow runtime.
+# - Snyk must be run from /tmp/extracted to scan the extracted customer code.
+# - Snyk Web GitHub Import will not see /tmp/extracted unless extracted code is
+#   committed to the repository. This workflow uses Snyk CLI + snyk monitor to
+#   create Snyk UI projects from the extracted code.
 #
-# Performance Impact:
-# - Scan time: +3-5 minutes (now ~8-10 min total)
-# - Free tier usage: 3.2% (was 2%, still excellent)
-# - Benefits: 50% reduction in false negatives, dual SAST coverage
+# Required repository secret:
+# - SNYK_TOKEN
 #
-# Compliance Standards:
-# - DISA ASD STIG (APSC-DV-002560, APSC-DV-003235)
-# - NIST SP 800-53 Rev 5 (SA-11, SR-3, SR-4, SI-2)
-# - NTIA SBOM Minimum Elements
-# - CVSS v3.1 / CISA VEX Guidelines
+# Recommended repository settings:
+# - Actions permissions: Read and write permissions
+# - Allow GitHub Actions to create and approve pull requests: not required
 ################################################################################
 
 name: DoD Security Scanner
 
 on:
+  workflow_dispatch:
+    inputs:
+      snyk_monitor:
+        description: 'Run snyk monitor to publish monitored projects into Snyk UI'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      commit_reports:
+        description: 'Commit generated reports to the reports/ folder'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      create_release:
+        description: 'Create a GitHub Release with report artifacts'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      detection_depth:
+        description: 'Snyk recursive project detection depth'
+        required: true
+        default: '10'
+        type: string
+
   push:
     paths:
       - 'customer-software/**'
+      - '.github/workflows/scan.yml'
 
 permissions:
   contents: write
-  security-events: write
+  actions: read
 
-################################################################################
-# JOB 1: EXTRACT & PREPARE
-# Author: Hector L Bones
-#
-# What it does:
-# - Extracts ZIP files from customer-software/ directory
-# - Copies all files to /tmp/extracted workspace
-# - Creates artifact for downstream jobs
-#
-# Why this exists:
-# Customers deliver code as ZIP files. This job standardizes the input format
-# and creates a clean, consistent workspace for all scanning operations.
-#
-# Timing: ~6 seconds
-################################################################################
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  EXTRACTED_DIR: /tmp/extracted
+  REPORTS_DIR: reports
+  SNYK_MONITOR_ENABLED: ${{ github.event.inputs.snyk_monitor || 'true' }}
+  COMMIT_REPORTS_ENABLED: ${{ github.event.inputs.commit_reports || 'true' }}
+  CREATE_RELEASE_ENABLED: ${{ github.event.inputs.create_release || 'true' }}
+  SNYK_DETECTION_DEPTH: ${{ github.event.inputs.detection_depth || '10' }}
 
 jobs:
-  extract-and-scan:
-    name: Extract & Prepare
+  ##############################################################################
+  # JOB 1: SAFELY EXTRACT CUSTOMER SOFTWARE
+  ##############################################################################
+  prepare-source:
+    name: Prepare Source
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Extract customer software
+
+      - name: Safely extract uploaded customer software
         run: |
-          echo "Extracting uploaded software..."
-          mkdir -p /tmp/extracted
-          
-          if ls customer-software/*.zip 1> /dev/null 2>&1; then
-            for zipfile in customer-software/*.zip; do
-              echo "Extracting: $zipfile"
-              unzip -q "$zipfile" -d /tmp/extracted
-            done
-          else
-            echo "No ZIP files found, copying directory contents"
-            cp -r customer-software/* /tmp/extracted/ 2>/dev/null || true
-          fi
-          
-          echo "Extracted files:"
-          ls -la /tmp/extracted
-      
-      - name: Upload extracted code artifact
+          set -euo pipefail
+
+          echo "Preparing extracted source workspace: ${EXTRACTED_DIR}"
+          rm -rf "${EXTRACTED_DIR}"
+          mkdir -p "${EXTRACTED_DIR}"
+          mkdir -p scan-metadata
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import zipfile
+          from datetime import datetime, timezone
+
+          source_dir = pathlib.Path('customer-software')
+          dest_dir = pathlib.Path(os.environ['EXTRACTED_DIR']).resolve()
+          metadata_dir = pathlib.Path('scan-metadata')
+          metadata_dir.mkdir(exist_ok=True)
+
+          summary = {
+              'generated_utc': datetime.now(timezone.utc).isoformat(),
+              'source_dir': str(source_dir),
+              'extracted_dir': str(dest_dir),
+              'zip_files': [],
+              'copied_files_mode': False,
+              'rejected_entries': [],
+              'extracted_file_count': 0,
+              'manifest_candidates': []
+          }
+
+          if not source_dir.exists():
+              raise SystemExit('customer-software/ does not exist')
+
+          zip_files = sorted(source_dir.glob('*.zip'))
+
+          def safe_extract_zip(zip_path: pathlib.Path, destination: pathlib.Path):
+              with zipfile.ZipFile(zip_path) as archive:
+                  for member in archive.infolist():
+                      member_name = member.filename
+                      target_path = (destination / member_name).resolve()
+                      # Block Zip Slip: absolute paths and ../ traversal.
+                      if target_path != destination and not str(target_path).startswith(str(destination) + os.sep):
+                          summary['rejected_entries'].append({
+                              'zip': str(zip_path),
+                              'entry': member_name,
+                              'reason': 'unsafe path traversal or absolute path'
+                          })
+                          continue
+                      archive.extract(member, destination)
+
+          if zip_files:
+              for zip_file in zip_files:
+                  print(f'Extracting ZIP: {zip_file}')
+                  summary['zip_files'].append(str(zip_file))
+                  safe_extract_zip(zip_file, dest_dir)
+          else:
+              print('No ZIP files found. Copying non-ZIP customer-software contents.')
+              summary['copied_files_mode'] = True
+              for item in source_dir.iterdir():
+                  if item.name.lower() in {'upload_here.md', '.gitkeep'}:
+                      continue
+                  target = dest_dir / item.name
+                  if item.is_dir():
+                      shutil.copytree(item, target, dirs_exist_ok=True)
+                  elif item.is_file():
+                      shutil.copy2(item, target)
+
+          manifest_names = {
+              'requirements.txt', 'requirements-dev.txt', 'requirements-test.txt',
+              'pyproject.toml', 'setup.py', 'setup.cfg', 'Pipfile', 'Pipfile.lock',
+              'poetry.lock', 'package.json', 'package-lock.json', 'yarn.lock',
+              'pnpm-lock.yaml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
+              'go.mod', 'go.sum', 'Gemfile', 'Gemfile.lock', 'composer.json',
+              'composer.lock', 'Cargo.toml', 'Cargo.lock', 'Dockerfile'
+          }
+
+          file_count = 0
+          for path in sorted(dest_dir.rglob('*')):
+              if path.is_file():
+                  file_count += 1
+                  if path.name in manifest_names or path.suffix == '.csproj':
+                      summary['manifest_candidates'].append(str(path))
+
+          summary['extracted_file_count'] = file_count
+
+          (metadata_dir / 'extraction-summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          (metadata_dir / 'extracted-file-list.txt').write_text(
+              '\n'.join(str(p) for p in sorted(dest_dir.rglob('*')) if p.is_file()),
+              encoding='utf-8'
+          )
+          (metadata_dir / 'manifest-candidates.txt').write_text(
+              '\n'.join(summary['manifest_candidates']),
+              encoding='utf-8'
+          )
+
+          print(f'Extracted file count: {file_count}')
+          print(f'Manifest candidates: {len(summary["manifest_candidates"])}')
+          if summary['rejected_entries']:
+              print(f'Rejected unsafe ZIP entries: {len(summary["rejected_entries"])}')
+          PY
+
+          echo "Extraction summary:"
+          cat scan-metadata/extraction-summary.json
+
+      - name: Upload extracted source artifact
         uses: actions/upload-artifact@v4
         with:
           name: extracted-code
-          path: /tmp/extracted
+          path: ${{ env.EXTRACTED_DIR }}
           retention-days: 7
+          if-no-files-found: error
 
-################################################################################
-# JOB 2: GENERATE SBOM
-# Author: Hector L Bones
-#
-# What it does:
-# - Scans extracted code for all dependencies (Python, Node, Java, Go, etc.)
-# - Generates Software Bill of Materials in SPDX 2.3 format
-# - Includes CPE and PURL identifiers for each package
-# - Commits SBOM to reports/ folder
-#
-# Why this exists:
-# SBOM is mandated by NTIA guidelines and DISA STIG APSC-DV-003235.
-# SPDX 2.3 is the DoD-preferred format (ISO/IEC 5962:2021).
-#
-# Timing: ~12 seconds
-################################################################################
+      - name: Upload extraction metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-metadata
+          path: scan-metadata
+          retention-days: 30
+          if-no-files-found: error
 
+  ##############################################################################
+  # JOB 2: GENERATE SBOM WITH SYFT
+  ##############################################################################
   generate-sbom:
     name: Generate SBOM
     runs-on: ubuntu-latest
-    needs: extract-and-scan
-    
+    needs: prepare-source
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: Download extracted code
+
+      - name: Download extracted source
         uses: actions/download-artifact@v4
         with:
           name: extracted-code
-          path: /tmp/extracted
-      
-      - name: Generate SBOM with Syft
+          path: ${{ env.EXTRACTED_DIR }}
+
+      - name: Generate SPDX SBOM with Syft
+        id: syft
+        continue-on-error: true
         uses: anchore/sbom-action@v0
         with:
-          path: /tmp/extracted
+          path: ${{ env.EXTRACTED_DIR }}
           format: spdx-json
           output-file: sbom-spdx.json
-      
-      - name: Commit SBOM to reports
-        run: |
-          git fetch origin
-          git reset --hard origin/main
-          mkdir -p reports
-          mv sbom-spdx.json reports/
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/sbom-spdx.json
-          git commit -m "Generated SBOM for scan run ${{ github.run_number }}" || echo "No changes"
-          git push
 
-################################################################################
-# JOB 3: SAST - CodeQL
-# Author: Hector L Bones
-#
-# What it does:
-# - Downloads customer code from artifact
-# - Copies customer code into workspace for scanning
-# - Performs deep semantic analysis for security vulnerabilities
-# - Scans for: SQL injection, XSS, path traversal, etc.
-# - Results visible in Security & quality tab
-#
-# Why this exists:
-# Required by DISA STIG APSC-DV-002560 for SAST execution.
-# CodeQL provides comprehensive security scanning with low false positives.
-# Semantic analysis catches complex vulnerabilities that pattern-based tools miss.
-#
-# NEW IN v1.2:
-# ✅ Now copies customer code to workspace before scanning
-# ✅ CodeQL can properly analyze customer code (not just workflow files)
-# ✅ Provides dual SAST coverage with Semgrep (50% fewer false negatives)
-#
-# Performance Impact:
-# - Additional time: +3-5 minutes per scan
-# - Free tier impact: +1.2% (negligible)
-# - Value: Comprehensive semantic analysis of customer code
-#
-# Timing: ~5-8 minutes (was ~3 min but didn't scan customer code)
-################################################################################
-
-  sast-codeql:
-    name: SAST - CodeQL
-    runs-on: ubuntu-latest
-    needs: extract-and-scan
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Download extracted code
-        uses: actions/download-artifact@v4
-        with:
-          name: extracted-code
-          path: /tmp/extracted
-      
-      # ========================================================================
-      # CODEQL FIX - Copy Customer Code to Workspace
-      # Author: Hector L Bones - May 7, 2026
-      #
-      # What this does:
-      # CodeQL scans the repository workspace by default. Customer code is
-      # uploaded as ZIP files and extracted to /tmp/extracted, which CodeQL
-      # doesn't scan. This step copies customer code into the workspace so
-      # CodeQL can analyze it properly.
-      #
-      # Why this is needed:
-      # Without this, CodeQL only sees workflow files and reports "no Python
-      # found" even though customer code exists. This was the cause of the
-      # "Exit code 32" error in previous runs.
-      #
-      # Impact:
-      # - Adds ~5 seconds to scan time (negligible)
-      # - Enables full semantic analysis of customer code
-      # - Reduces false negative rate by ~50%
-      # - Provides GitHub Security tab integration
-      # ========================================================================
-      - name: Copy customer code to workspace
+      - name: Normalize SBOM output
+        if: always()
         run: |
-          echo "📦 Copying customer code to workspace for CodeQL scanning..."
-          mkdir -p customer-code
-          
-          # Copy all extracted files
-          if [ -d "/tmp/extracted" ] && [ "$(ls -A /tmp/extracted)" ]; then
-            cp -r /tmp/extracted/* customer-code/
-            echo "✅ Customer code copied successfully"
-            echo "📂 Contents:"
-            ls -la customer-code/
+          mkdir -p out
+          if [ -s sbom-spdx.json ]; then
+            cp sbom-spdx.json out/sbom-spdx.json
+            echo '{"scanner":"syft","status":"EXECUTED"}' > out/sbom-status.json
           else
-            echo "⚠️  No extracted code found"
-            # Create empty directory so CodeQL doesn't fail
-            touch customer-code/.gitkeep
+            cat > out/sbom-spdx.json <<'JSON'
+          {
+            "scanner": "syft",
+            "status": "NO_VALID_OUTPUT",
+            "reason": "Syft did not produce a non-empty SPDX JSON file. Review workflow logs."
+          }
+          JSON
+            cat > out/sbom-status.json <<'JSON'
+          {"scanner":"syft","status":"NO_VALID_OUTPUT"}
+          JSON
           fi
-      
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+
+      - name: Upload SBOM results
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          languages: python, javascript
-          # Tell CodeQL to scan the customer-code directory
-          source-root: customer-code
-      
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        continue-on-error: true
+          name: sbom-results
+          path: out
+          retention-days: 30
+          if-no-files-found: error
 
-################################################################################
-# JOB 4: SAST - Semgrep
-# Author: Hector L Bones
-#
-# What it does:
-# - Fast pattern-based security scanning
-# - Runs 1000+ security rules across multiple languages
-# - Detects: OWASP Top 10, injection flaws, hardcoded secrets
-#
-# Why this exists:
-# Provides complementary coverage to CodeQL with different detection approach.
-# Semgrep excels at finding common vulnerability patterns quickly.
-# Together with CodeQL, provides dual SAST methodology for enhanced coverage.
-#
-# Timing: ~21 seconds
-################################################################################
-
-  sast-semgrep:
-    name: SAST - Semgrep
-    runs-on: ubuntu-latest
-    needs: extract-and-scan
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Download extracted code
-        uses: actions/download-artifact@v4
-        with:
-          name: extracted-code
-          path: /tmp/extracted
-      
-      - name: Run Semgrep
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: auto
-        continue-on-error: true
-
-################################################################################
-# JOB 5: SCA SCANNING
-# Author: Hector L Bones
-#
-# What it does:
-# - Snyk: Scans dependencies against proprietary vulnerability database
-# - Grype: Scans dependencies against NVD CVE database
-# - Both generate JSON results with CVE IDs, CVSS scores, remediation advice
-#
-# Why this exists:
-# Required by DISA STIG APSC-DV-003235 for dependency scanning.
-# Dual scanning provides comprehensive coverage and validation.
-#
-# CRITICAL FIX APPLIED (v1.1):
-# ✅ Removed --severity-threshold=critical from Snyk
-# This was causing potential false failures when vulnerabilities were found.
-# Now Snyk reports ALL vulnerabilities without failing the job.
-#
-# Background: During initial testing, Snyk would fail the job if critical
-# vulnerabilities were found due to the threshold. Removing it ensures all
-# findings are reported for review without blocking the workflow.
-#
-# Timing: ~1 minute
-################################################################################
-
+  ##############################################################################
+  # JOB 3: SCA WITH SNYK AND GRYPE
+  ##############################################################################
   sca-scan:
-    name: SCA Scanning
+    name: SCA - Snyk and Grype
     runs-on: ubuntu-latest
-    needs: extract-and-scan
-    
+    needs: prepare-source
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: Download extracted code
+
+      - name: Download extracted source
         uses: actions/download-artifact@v4
         with:
           name: extracted-code
-          path: /tmp/extracted
-      
-      # ========================================================================
-      # SNYK SECURITY SCAN
-      # Fix Applied: Removed --severity-threshold=critical (v1.1)
-      # Author: Hector L Bones - May 7, 2026
-      # ========================================================================
-      - name: Run Snyk Security Scan
+          path: ${{ env.EXTRACTED_DIR }}
+
+      - name: Set up Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Debug manifest detection before Snyk
+        run: |
+          mkdir -p out
+          echo "Extracted directory: ${EXTRACTED_DIR}"
+          echo "Snyk detection depth: ${SNYK_DETECTION_DEPTH}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch/ref: ${{ github.ref_name }}"
+          echo "Files under extracted source:"
+          find "${EXTRACTED_DIR}" -maxdepth 8 -type f | sort | tee out/snyk-debug-file-list.txt
+          echo "Manifest candidates:"
+          find "${EXTRACTED_DIR}" -maxdepth 12 -type f \( \
+            -name "requirements*.txt" -o \
+            -name "pyproject.toml" -o \
+            -name "setup.py" -o \
+            -name "setup.cfg" -o \
+            -name "Pipfile" -o \
+            -name "Pipfile.lock" -o \
+            -name "poetry.lock" -o \
+            -name "package.json" -o \
+            -name "package-lock.json" -o \
+            -name "yarn.lock" -o \
+            -name "pnpm-lock.yaml" -o \
+            -name "pom.xml" -o \
+            -name "build.gradle" -o \
+            -name "build.gradle.kts" -o \
+            -name "*.csproj" -o \
+            -name "go.mod" -o \
+            -name "Gemfile" -o \
+            -name "composer.json" -o \
+            -name "Cargo.toml" -o \
+            -name "Dockerfile" \
+          \) -print | sort | tee out/snyk-manifest-candidates.txt
+
+      - name: Run Snyk Open Source test against extracted code
+        if: always()
         continue-on-error: true
-        uses: snyk/actions@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          # NOTE: --severity-threshold=critical REMOVED in v1.1
-          # Now reports all vulnerabilities without failing job
-          args: --all-projects --json-file-output=snyk-results.json
-      
-      - name: Run Grype Vulnerability Scan
+        run: |
+          mkdir -p out
+
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            cat > out/snyk-results.json <<'JSON'
+          {
+            "scanner": "snyk",
+            "status": "NOT_EXECUTED",
+            "reason": "Repository secret SNYK_TOKEN is not configured."
+          }
+          JSON
+            echo '{"scanner":"snyk","command":"test","status":"NOT_EXECUTED","reason":"Missing SNYK_TOKEN"}' > out/snyk-test-status.json
+            exit 0
+          fi
+
+          set +e
+          cd "${EXTRACTED_DIR}"
+          snyk --version | tee "${GITHUB_WORKSPACE}/out/snyk-version.txt"
+          snyk test \
+            --all-projects \
+            --detection-depth="${SNYK_DETECTION_DEPTH}" \
+            --json-file-output="${GITHUB_WORKSPACE}/out/snyk-results.json" \
+            --remote-repo-url="https://github.com/${{ github.repository }}" \
+            --target-reference="${{ github.ref_name }}"
+          SNYK_EXIT=$?
+          set -e
+
+          cd "${GITHUB_WORKSPACE}"
+          if [ ! -s out/snyk-results.json ]; then
+            cat > out/snyk-results.json <<JSON
+          {
+            "scanner": "snyk",
+            "status": "NO_VALID_OUTPUT",
+            "exit_code": ${SNYK_EXIT},
+            "reason": "snyk test did not produce JSON output. Exit code 3 usually means no supported projects detected."
+          }
+          JSON
+          fi
+
+          cat > out/snyk-test-status.json <<JSON
+          {"scanner":"snyk","command":"test","status":"COMPLETED_WITH_EXIT_CODE","exit_code":${SNYK_EXIT}}
+          JSON
+
+      - name: Run Snyk monitor to publish projects into Snyk UI
+        if: always()
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          mkdir -p out
+
+          if [ "${SNYK_MONITOR_ENABLED}" != "true" ]; then
+            echo '{"scanner":"snyk","command":"monitor","status":"SKIPPED","reason":"snyk_monitor input disabled"}' > out/snyk-monitor-status.json
+            exit 0
+          fi
+
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            echo '{"scanner":"snyk","command":"monitor","status":"NOT_EXECUTED","reason":"Missing SNYK_TOKEN"}' > out/snyk-monitor-status.json
+            exit 0
+          fi
+
+          set +e
+          cd "${EXTRACTED_DIR}"
+          snyk monitor \
+            --all-projects \
+            --detection-depth="${SNYK_DETECTION_DEPTH}" \
+            --remote-repo-url="https://github.com/${{ github.repository }}" \
+            --target-reference="${{ github.ref_name }}" \
+            > "${GITHUB_WORKSPACE}/out/snyk-monitor.log" 2>&1
+          MONITOR_EXIT=$?
+          set -e
+
+          cd "${GITHUB_WORKSPACE}"
+          cat > out/snyk-monitor-status.json <<JSON
+          {"scanner":"snyk","command":"monitor","status":"COMPLETED_WITH_EXIT_CODE","exit_code":${MONITOR_EXIT}}
+          JSON
+
+      - name: Run Grype vulnerability scan
+        id: grype
         continue-on-error: true
         uses: anchore/scan-action@v3
         with:
-          path: /tmp/extracted
+          path: ${{ env.EXTRACTED_DIR }}
           output-format: json
-          output-file: grype-results.json
-      
-      - name: Commit SCA results
+          output-file: out/grype-results.json
+          fail-build: false
+
+      - name: Normalize Grype output
+        if: always()
         run: |
-          git fetch origin
-          git reset --hard origin/main
-          mkdir -p reports
-          mv snyk-results.json reports/ 2>/dev/null || echo "No Snyk results"
-          mv grype-results.json reports/ 2>/dev/null || echo "No Grype results"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/*.json
-          git commit -m "SCA scan results for run ${{ github.run_number }}" || echo "No changes"
-          git push
+          mkdir -p out
+          if [ -s out/grype-results.json ]; then
+            echo '{"scanner":"grype","status":"EXECUTED"}' > out/grype-status.json
+          else
+            cat > out/grype-results.json <<'JSON'
+          {
+            "scanner": "grype",
+            "status": "NO_VALID_OUTPUT",
+            "reason": "Grype did not produce a non-empty JSON file. Review workflow logs."
+          }
+          JSON
+            echo '{"scanner":"grype","status":"NO_VALID_OUTPUT"}' > out/grype-status.json
+          fi
 
-################################################################################
-# JOB 6: GENERATE REPORT
-# Author: Hector L Bones
-#
-# What it does:
-# - Generates DoD-compliant markdown report summarizing all findings
-# - Verifies all files exist and have content (FIX in v1.1)
-# - Creates GitHub Release with all deliverables packaged
-#
-# Why this exists:
-# Provides audit-ready documentation for DoD compliance reviews.
-# Release artifacts serve as permanent record and easy download for customers.
-#
-# CRITICAL FIX APPLIED (v1.1):
-# ✅ Added file verification before release creation
-# This prevents "size must be greater than or equal to 1" validation errors
-# that occurred when scanner outputs were empty or missing.
-#
-# Background: During ansible/pylibssh test (Run #14, Line 253), grype-results.json
-# was empty and caused GitHub Release upload to fail. The new verification step
-# ensures all files have minimum content before packaging.
-#
-# Timing: ~11 seconds
-################################################################################
+      - name: Upload SCA results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-results
+          path: out
+          retention-days: 30
+          if-no-files-found: error
 
-  generate-report:
-    name: Generate Report
+  ##############################################################################
+  # JOB 4: SAST WITH SEMGREP COMMUNITY RULES
+  ##############################################################################
+  sast-semgrep:
+    name: SAST - Semgrep
     runs-on: ubuntu-latest
-    needs: [generate-sbom, sast-codeql, sast-semgrep, sca-scan]
+    needs: prepare-source
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extracted source
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-code
+          path: ${{ env.EXTRACTED_DIR }}
+
+      - name: Install Semgrep
+        continue-on-error: true
+        run: |
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user semgrep
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Semgrep against extracted code
+        continue-on-error: true
+        run: |
+          mkdir -p out
+          if ! command -v semgrep >/dev/null 2>&1; then
+            cat > out/semgrep-results.json <<'JSON'
+          {
+            "scanner": "semgrep",
+            "status": "NOT_EXECUTED",
+            "reason": "Semgrep was not installed successfully."
+          }
+          JSON
+            echo '{"scanner":"semgrep","status":"NOT_EXECUTED"}' > out/semgrep-status.json
+            exit 0
+          fi
+
+          set +e
+          semgrep scan \
+            --config p/default \
+            --json \
+            --output out/semgrep-results.json \
+            "${EXTRACTED_DIR}"
+          SEMGREP_EXIT=$?
+          set -e
+
+          if [ ! -s out/semgrep-results.json ]; then
+            cat > out/semgrep-results.json <<JSON
+          {
+            "scanner": "semgrep",
+            "status": "NO_VALID_OUTPUT",
+            "exit_code": ${SEMGREP_EXIT},
+            "reason": "Semgrep did not produce JSON output. Review workflow logs."
+          }
+          JSON
+          fi
+
+          cat > out/semgrep-status.json <<JSON
+          {"scanner":"semgrep","status":"COMPLETED_WITH_EXIT_CODE","exit_code":${SEMGREP_EXIT}}
+          JSON
+
+      - name: Upload Semgrep results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-semgrep-results
+          path: out
+          retention-days: 30
+          if-no-files-found: error
+
+  ##############################################################################
+  # JOB 5: CONSOLIDATE REPORTS, COMMIT ONCE, AND RELEASE
+  ##############################################################################
+  generate-report:
+    name: Generate Final Report
+    runs-on: ubuntu-latest
+    needs:
+      - prepare-source
+      - generate-sbom
+      - sca-scan
+      - sast-semgrep
     if: always()
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Pull latest changes
+
+      - name: Sync branch before report generation
         run: |
           git fetch origin
-          git reset --hard origin/main
-      
-      - name: Generate compliance report
+          git reset --hard "origin/${{ github.ref_name }}"
+
+      - name: Download all scanner artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifact-downloads
+
+      - name: Consolidate scanner outputs
         run: |
-          git fetch origin
-          git reset --hard origin/main
-          mkdir -p reports
-          
+          set -euo pipefail
+          mkdir -p "${REPORTS_DIR}"
+
+          echo "Downloaded artifacts:"
+          find artifact-downloads -maxdepth 3 -type f | sort
+
+          copy_if_exists() {
+            local src="$1"
+            local dst="$2"
+            if [ -f "$src" ]; then
+              cp "$src" "$dst"
+            fi
+          }
+
+          copy_if_exists artifact-downloads/extracted-metadata/extraction-summary.json "${REPORTS_DIR}/extraction-summary.json"
+          copy_if_exists artifact-downloads/extracted-metadata/extracted-file-list.txt "${REPORTS_DIR}/extracted-file-list.txt"
+          copy_if_exists artifact-downloads/extracted-metadata/manifest-candidates.txt "${REPORTS_DIR}/manifest-candidates.txt"
+
+          copy_if_exists artifact-downloads/sbom-results/sbom-spdx.json "${REPORTS_DIR}/sbom-spdx.json"
+          copy_if_exists artifact-downloads/sbom-results/sbom-status.json "${REPORTS_DIR}/sbom-status.json"
+
+          copy_if_exists artifact-downloads/sca-results/snyk-results.json "${REPORTS_DIR}/snyk-results.json"
+          copy_if_exists artifact-downloads/sca-results/snyk-test-status.json "${REPORTS_DIR}/snyk-test-status.json"
+          copy_if_exists artifact-downloads/sca-results/snyk-monitor-status.json "${REPORTS_DIR}/snyk-monitor-status.json"
+          copy_if_exists artifact-downloads/sca-results/snyk-monitor.log "${REPORTS_DIR}/snyk-monitor.log"
+          copy_if_exists artifact-downloads/sca-results/snyk-version.txt "${REPORTS_DIR}/snyk-version.txt"
+          copy_if_exists artifact-downloads/sca-results/snyk-manifest-candidates.txt "${REPORTS_DIR}/snyk-manifest-candidates.txt"
+          copy_if_exists artifact-downloads/sca-results/snyk-debug-file-list.txt "${REPORTS_DIR}/snyk-debug-file-list.txt"
+          copy_if_exists artifact-downloads/sca-results/grype-results.json "${REPORTS_DIR}/grype-results.json"
+          copy_if_exists artifact-downloads/sca-results/grype-status.json "${REPORTS_DIR}/grype-status.json"
+
+          copy_if_exists artifact-downloads/sast-semgrep-results/semgrep-results.json "${REPORTS_DIR}/semgrep-results.json"
+          copy_if_exists artifact-downloads/sast-semgrep-results/semgrep-status.json "${REPORTS_DIR}/semgrep-status.json"
+
+          # Create truthful placeholders only when a scanner result is missing.
+          [ -s "${REPORTS_DIR}/sbom-spdx.json" ] || echo '{"scanner":"syft","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/sbom-spdx.json"
+          [ -s "${REPORTS_DIR}/snyk-results.json" ] || echo '{"scanner":"snyk","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/snyk-results.json"
+          [ -s "${REPORTS_DIR}/grype-results.json" ] || echo '{"scanner":"grype","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/grype-results.json"
+          [ -s "${REPORTS_DIR}/semgrep-results.json" ] || echo '{"scanner":"semgrep","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/semgrep-results.json"
+
+      - name: Generate audit-ready markdown report
+        run: |
+          set -euo pipefail
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          REPORT_FILE="reports/SCA-Report-${TIMESTAMP}.md"
-          
-          echo "# SOFTWARE COMPOSITION ANALYSIS REPORT" > "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "## Document Information" >> "$REPORT_FILE"
-          echo "Report Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$REPORT_FILE"
-          echo "Report ID: SCA-${TIMESTAMP}" >> "$REPORT_FILE"
-          echo "Project: ${{ github.repository }}" >> "$REPORT_FILE"
-          echo "Scan Run: #${{ github.run_number }}" >> "$REPORT_FILE"
-          echo "Generated By: Automated SCA Scanner v1.2" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "## EXECUTIVE SUMMARY" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "This automated security scan analyzed the provided source code." >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "### Scan Coverage" >> "$REPORT_FILE"
-          echo "SBOM Generated (SPDX 2.3 format)" >> "$REPORT_FILE"
-          echo "SAST Executed (CodeQL + Semgrep - Dual methodology)" >> "$REPORT_FILE"
-          echo "SCA Performed (Snyk + Grype)" >> "$REPORT_FILE"
-          echo "DoD/DISA Compliance Verified" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "### Scan Results" >> "$REPORT_FILE"
-          echo "SBOM Location: reports/sbom-spdx.json" >> "$REPORT_FILE"
-          echo "SAST Findings: View in Security & quality tab" >> "$REPORT_FILE"
-          echo "SCA Results: reports/snyk-results.json and reports/grype-results.json" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "## DETAILED FINDINGS" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "### 1. Software Bill of Materials" >> "$REPORT_FILE"
-          echo "Format: SPDX 2.3 (ISO/IEC 5962:2021)" >> "$REPORT_FILE"
-          echo "File: reports/sbom-spdx.json" >> "$REPORT_FILE"
-          echo "Compliance: NTIA Minimum Elements" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "### 2. Static Analysis" >> "$REPORT_FILE"
-          echo "Tools Used: GitHub CodeQL and Semgrep (Dual SAST)" >> "$REPORT_FILE"
-          echo "Coverage: Multi-language security pattern analysis + semantic analysis" >> "$REPORT_FILE"
-          echo "View Results: Security & quality tab" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "### 3. Dependency Analysis" >> "$REPORT_FILE"
-          echo "Tools Used: Snyk and Grype" >> "$REPORT_FILE"
-          echo "Database: NVD CVE Database (latest)" >> "$REPORT_FILE"
-          echo "Files: reports/snyk-results.json and reports/grype-results.json" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "## COMPLIANCE VERIFICATION" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "SBOM Generation: NTIA Minimum Elements - PASS" >> "$REPORT_FILE"
-          echo "SAST Execution: DISA ASD STIG APSC-DV-002560 - PASS (Enhanced: Dual methodology)" >> "$REPORT_FILE"
-          echo "SCA Scanning: DISA ASD STIG APSC-DV-003235 - PASS" >> "$REPORT_FILE"
-          echo "CVSS Scoring: CVSS v3.1 - PASS" >> "$REPORT_FILE"
-          echo "VEX Assessment: CISA Guidelines - PASS" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "## STANDARDS MET" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "DISA Application Security and Development STIG" >> "$REPORT_FILE"
-          echo "NIST SP 800-53 Rev 5 (SA-11, SR-3, SR-4, SI-2)" >> "$REPORT_FILE"
-          echo "NTIA SBOM Minimum Elements" >> "$REPORT_FILE"
-          echo "CISA Secure Software Development" >> "$REPORT_FILE"
-          echo "DoD DevSecOps Reference Architecture" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "---" >> "$REPORT_FILE"
-          echo "Classification: UNCLASSIFIED" >> "$REPORT_FILE"
-          echo "Report Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$REPORT_FILE"
-          echo "Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$REPORT_FILE"
-          echo "" >> "$REPORT_FILE"
-          echo "This report meets DoD cybersecurity documentation requirements." >> "$REPORT_FILE"
-          
+          REPORT_FILE="${REPORTS_DIR}/SCA-Report-${TIMESTAMP}.md"
+          STATUS_FILE="${REPORTS_DIR}/scan-status-${TIMESTAMP}.json"
+
+          json_status() {
+            local file="$1"
+            if [ ! -s "$file" ]; then
+              echo "MISSING"
+              return
+            fi
+            if jq empty "$file" >/dev/null 2>&1; then
+              jq -r '.status? // "EXECUTED"' "$file" 2>/dev/null || echo "EXECUTED"
+            else
+              echo "INVALID_JSON"
+            fi
+          }
+
+          json_count() {
+            local file="$1"
+            local expr="$2"
+            if [ ! -s "$file" ] || ! jq empty "$file" >/dev/null 2>&1; then
+              echo "N/A"
+              return
+            fi
+            jq -r "$expr" "$file" 2>/dev/null || echo "N/A"
+          }
+
+          SBOM_STATUS=$(json_status "${REPORTS_DIR}/sbom-spdx.json")
+          SNYK_STATUS=$(json_status "${REPORTS_DIR}/snyk-results.json")
+          GRYPE_STATUS=$(json_status "${REPORTS_DIR}/grype-results.json")
+          SEMGREP_STATUS=$(json_status "${REPORTS_DIR}/semgrep-results.json")
+
+          SNYK_VULN_COUNT=$(json_count "${REPORTS_DIR}/snyk-results.json" 'if type == "array" then ([.[].vulnerabilities[]?] | length) else (.vulnerabilities? // [] | length) end')
+          GRYPE_MATCH_COUNT=$(json_count "${REPORTS_DIR}/grype-results.json" '.matches? // [] | length')
+          SEMGREP_FINDING_COUNT=$(json_count "${REPORTS_DIR}/semgrep-results.json" '.results? // [] | length')
+          SBOM_PACKAGE_COUNT=$(json_count "${REPORTS_DIR}/sbom-spdx.json" '.packages? // [] | length')
+          MANIFEST_COUNT=$(grep -cve '^$' "${REPORTS_DIR}/manifest-candidates.txt" 2>/dev/null || echo 0)
+
+          cat > "$STATUS_FILE" <<JSON
+          {
+            "generated_utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+            "repository": "${{ github.repository }}",
+            "run_number": "${{ github.run_number }}",
+            "run_id": "${{ github.run_id }}",
+            "sbom_status": "${SBOM_STATUS}",
+            "snyk_status": "${SNYK_STATUS}",
+            "grype_status": "${GRYPE_STATUS}",
+            "semgrep_status": "${SEMGREP_STATUS}",
+            "manifest_candidate_count": "${MANIFEST_COUNT}",
+            "sbom_package_count": "${SBOM_PACKAGE_COUNT}",
+            "snyk_vulnerability_count": "${SNYK_VULN_COUNT}",
+            "grype_match_count": "${GRYPE_MATCH_COUNT}",
+            "semgrep_finding_count": "${SEMGREP_FINDING_COUNT}"
+          }
+          JSON
+
+          cat > "$REPORT_FILE" <<MD
+          # Software Security Scan Report
+
+          ## Document Information
+
+          | Field | Value |
+          |---|---|
+          | Report Date | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+          | Report ID | SCA-${TIMESTAMP} |
+          | Repository | ${{ github.repository }} |
+          | Branch / Ref | ${{ github.ref_name }} |
+          | Workflow Run | #${{ github.run_number }} |
+          | Scanner Workflow | DoD Security Scanner v2.0 |
+          | Classification | UNCLASSIFIED |
+
+          ## Executive Summary
+
+          This workflow scanned the extracted customer software package from \`customer-software/\`. The extracted source was staged in the runner at \`${EXTRACTED_DIR}\`, scanned, and converted into persistent reports under \`${REPORTS_DIR}/\`.
+
+          ## Source Preparation
+
+          | Item | Result |
+          |---|---:|
+          | Manifest candidates detected | ${MANIFEST_COUNT} |
+          | Extraction summary | \`${REPORTS_DIR}/extraction-summary.json\` |
+          | Extracted file inventory | \`${REPORTS_DIR}/extracted-file-list.txt\` |
+          | Manifest candidate list | \`${REPORTS_DIR}/manifest-candidates.txt\` |
+
+          ## Scanner Results
+
+          | Domain | Tool | Status | Count / Evidence | Output |
+          |---|---|---|---:|---|
+          | SBOM | Syft | ${SBOM_STATUS} | Packages: ${SBOM_PACKAGE_COUNT} | \`${REPORTS_DIR}/sbom-spdx.json\` |
+          | SCA | Snyk Open Source | ${SNYK_STATUS} | Vulnerabilities: ${SNYK_VULN_COUNT} | \`${REPORTS_DIR}/snyk-results.json\` |
+          | SCA | Grype | ${GRYPE_STATUS} | Matches: ${GRYPE_MATCH_COUNT} | \`${REPORTS_DIR}/grype-results.json\` |
+          | SAST | Semgrep | ${SEMGREP_STATUS} | Findings: ${SEMGREP_FINDING_COUNT} | \`${REPORTS_DIR}/semgrep-results.json\` |
+
+          ## Snyk UI Publication
+
+          Snyk monitor setting for this run: \`${SNYK_MONITOR_ENABLED}\`.
+
+          When enabled and when \`SNYK_TOKEN\` is valid, this workflow runs \`snyk monitor\` from \`${EXTRACTED_DIR}\` so Snyk can create monitored projects from the extracted customer code. This is separate from Snyk Web GitHub Import, which only sees committed repository files.
+
+          Related evidence:
+
+          - \`${REPORTS_DIR}/snyk-test-status.json\`
+          - \`${REPORTS_DIR}/snyk-monitor-status.json\`
+          - \`${REPORTS_DIR}/snyk-monitor.log\`
+          - \`${REPORTS_DIR}/snyk-manifest-candidates.txt\`
+
+          ## Compliance Mapping
+
+          | Control Area | Evidence Generated | Status Basis |
+          |---|---|---|
+          | SBOM Generation | SPDX JSON SBOM | File exists and is non-empty; package count reported when available |
+          | Dependency / SCA Review | Snyk and Grype JSON outputs | Scanner status and vulnerability/match counts reported truthfully |
+          | Static Analysis | Semgrep JSON output | Scanner status and finding count reported truthfully |
+          | Audit Traceability | Extraction summary, file inventory, manifest list, scanner status files | Persistent artifacts committed/released for review |
+
+          ## Important Limitations
+
+          - Runtime-extracted files are not automatically committed to GitHub.
+          - Snyk Web GitHub Import will not see files under \`/tmp/extracted\` unless they are committed to the repository.
+          - This workflow intentionally uses Snyk CLI from \`/tmp/extracted\` and optionally \`snyk monitor\` to publish monitored projects to Snyk.
+          - GitHub CodeQL is not included by default because GitHub Free private repositories generally do not support GitHub code scanning alerts for private repositories.
+
+          ## Workflow Link
+
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MD
+
+          echo "Generated report: ${REPORT_FILE}"
+          ls -lah "${REPORTS_DIR}"
+
+      - name: Commit reports to repository
+        if: ${{ always() && env.COMMIT_REPORTS_ENABLED == 'true' }}
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/
-          git commit -m "Generated compliance report ${TIMESTAMP}" || echo "No changes"
+          git add "${REPORTS_DIR}/"
+          git commit -m "Security scan reports for run ${{ github.run_number }}" || echo "No report changes to commit"
           git push
 
-      # ========================================================================
-      # FILE VERIFICATION STEP
-      # Author: Hector L Bones - May 7, 2026
-      # 
-      # What it does:
-      # - Checks that all report files exist
-      # - Verifies each file has minimum size (not empty)
-      # - Creates placeholder content if files missing or empty
-      #
-      # Why this exists:
-      # During ansible/pylibssh test (Run #14), grype-results.json was empty
-      # and caused "Validation Failed: size must be greater than or equal to 1"
-      # error during GitHub Release upload. This step ensures all deliverables
-      # are present and valid before packaging.
-      #
-      # This fix addresses the Line 253 error from the May 6, 2026 test run.
-      # ========================================================================
-      - name: Verify reports exist and have content
+      - name: Upload consolidated reports artifact
         if: always()
-        run: |
-          echo "=== Verifying report files before release ==="
-          mkdir -p reports
-          
-          # Ensure SCA report exists
-          if ! ls reports/SCA-Report-*.md 1> /dev/null 2>&1; then
-            echo "⚠️  No SCA report found, creating placeholder"
-            echo "Scan completed - see workflow logs for details" > reports/README.txt
-          else
-            echo "✅ SCA report found"
-          fi
-          
-          # Ensure SBOM has minimum size (10 bytes)
-          if [ ! -f reports/sbom-spdx.json ]; then
-            echo "⚠️  SBOM file missing, creating placeholder"
-            echo '{"note": "No dependencies detected"}' > reports/sbom-spdx.json
-          else
-            SBOM_SIZE=$(stat -c%s reports/sbom-spdx.json 2>/dev/null || echo 0)
-            if [ "$SBOM_SIZE" -lt 10 ]; then
-              echo "⚠️  SBOM file empty, adding content"
-              echo '{"note": "No dependencies detected"}' > reports/sbom-spdx.json
-            else
-              echo "✅ SBOM file valid ($SBOM_SIZE bytes)"
-            fi
-          fi
-          
-          # Ensure Grype results have minimum size (10 bytes)
-          # This specifically fixes the Line 253 error from Run #14
-          if [ ! -f reports/grype-results.json ]; then
-            echo "⚠️  Grype results missing, creating placeholder"
-            echo '{"matches": [], "note": "Scanner unavailable"}' > reports/grype-results.json
-          else
-            GRYPE_SIZE=$(stat -c%s reports/grype-results.json 2>/dev/null || echo 0)
-            if [ "$GRYPE_SIZE" -lt 10 ]; then
-              echo "⚠️  Grype results empty, adding content (fixes Run #14 error)"
-              echo '{"matches": [], "note": "Scanner unavailable"}' > reports/grype-results.json
-            else
-              echo "✅ Grype results valid ($GRYPE_SIZE bytes)"
-            fi
-          fi
-          
-          # Ensure Snyk results have minimum size (10 bytes)
-          if [ ! -f reports/snyk-results.json ]; then
-            echo "⚠️  Snyk results missing, creating placeholder"
-            echo '{"vulnerabilities": [], "note": "Scanner unavailable"}' > reports/snyk-results.json
-          else
-            SNYK_SIZE=$(stat -c%s reports/snyk-results.json 2>/dev/null || echo 0)
-            if [ "$SNYK_SIZE" -lt 10 ]; then
-              echo "⚠️  Snyk results empty, adding content"
-              echo '{"vulnerabilities": [], "note": "Scanner unavailable"}' > reports/snyk-results.json
-            else
-              echo "✅ Snyk results valid ($SNYK_SIZE bytes)"
-            fi
-          fi
-          
-          echo "=== Verification complete ==="
-          echo "Final report directory contents:"
-          ls -lah reports/
-      
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-security-reports
+          path: reports
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Create release with reports
-        if: always()
+        if: ${{ always() && env.CREATE_RELEASE_ENABLED == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: scan-${{ github.run_number }}
           name: Security Scan Results - Run ${{ github.run_number }}
           body: |
-            ## DoD Security Scan Complete
-            
-            **Scan Date:** ${{ github.event.head_commit.timestamp }}
-            **Commit:** ${{ github.sha }}
-            **Scanner Version:** v1.2 (Enhanced CodeQL)
-            
-            ### Deliverables
-            - SBOM (SPDX 2.3 format)
-            - SAST Results (CodeQL + Semgrep - Dual methodology)
-            - SCA Results (Snyk + Grype)
-            - Compliance Report
-            
-            ### Standards Compliance
-            ✅ DISA ASD STIG (Enhanced: Dual SAST)
-            ✅ NIST SP 800-53 Rev 5
-            ✅ NTIA SBOM Requirements
-            ✅ CVSS v3.1 Scoring
-            
-            ### Scan Enhancements (v1.2)
-            🆕 CodeQL now analyzes customer code
-            🆕 Semantic analysis for complex vulnerabilities
-            🆕 50% reduction in false negatives
-            
-            Download all artifacts below for audit documentation.
+            ## Security Scan Complete
+
+            Repository: `${{ github.repository }}`
+            Branch/ref: `${{ github.ref_name }}`
+            Workflow run: `${{ github.run_number }}`
+
+            ### Included Deliverables
+            - Extraction summary and file inventory
+            - Manifest candidate list
+            - SBOM in SPDX JSON format
+            - Snyk Open Source JSON results
+            - Snyk monitor status/log
+            - Grype JSON results
+            - Semgrep JSON results
+            - Audit-ready markdown report
+
+            This release contains scanner evidence. Review scanner status fields before treating a control area as passed.
           files: |
-            reports/SCA-Report-*.md
-            reports/sbom-spdx.json
-            reports/snyk-results.json
-            reports/grype-results.json
+            reports/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-################################################################################
-# END OF WORKFLOW
-# 
-# Author: Hector L Bones
-# Version: 1.2 - Production Ready with CodeQL Fix
-# Last Updated: May 7, 2026
-# 
-# Changelog v1.2:
-# - NEW: CodeQL copies customer code to workspace for proper scanning
-# - NEW: Dual SAST methodology (CodeQL + Semgrep)
-# - Fixed: Removed Snyk --severity-threshold=critical (v1.1)
-# - Fixed: Added file verification before release (v1.1)
-# - Fixed: YAML syntax in report generation (v1.1)
-# - Validated: ansible/pylibssh (34 packages)
-# 
-# Performance Metrics:
-# - Scan time: ~8-10 minutes (was ~5 min)
-# - Free tier usage: 3.2% for 8 scans/month (was 2%)
-# - Benefits: 50% fewer false negatives, comprehensive SAST
-# 
-# Maintenance Notes:
-# - Monitor GitHub Actions: Settings → Billing → Usage
-# - Monitor Snyk: snyk.io → Settings → Usage
-# - Regenerate SNYK_TOKEN annually
-# - Expected scan time: 8-10 minutes per project
-# 
-# Known Issues:
-# - None! CodeQL now scans customer code successfully
-# - Grype database age warnings (free tier limitation)
-# - Node.js 20 deprecation (safe until June 2026)
-# 
-# Support: Hector L Bones (DoD Cybersecurity)
-################################################################################
