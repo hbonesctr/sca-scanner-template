@@ -19,7 +19,7 @@
 #
 # Required repository secret:
 # - SNYK_TOKEN
-#
+# - SNYK_ORG_ID
 # Recommended repository settings:
 # - Actions permissions: Read and write permissions
 # - Allow GitHub Actions to create and approve pull requests: not required
@@ -31,510 +31,655 @@ on:
   workflow_dispatch:
     inputs:
       snyk_monitor:
-        description: 'Run snyk monitor to publish monitored projects into Snyk UI'
+        description: "Publish monitored projects into the Snyk UI using snyk monitor"
         required: true
-        default: 'true'
+        default: "true"
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
+
+      snyk_unmanaged_fallback:
+        description: "Also run Snyk unmanaged scan/monitor for C/C++ or source-only projects"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
       commit_reports:
-        description: 'Commit generated reports to the reports/ folder'
+        description: "Commit generated reports back into the repository reports/ folder"
         required: true
-        default: 'true'
+        default: "true"
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
+
       create_release:
-        description: 'Create a GitHub Release with report artifacts'
+        description: "Create a GitHub Release containing the scan reports"
         required: true
-        default: 'true'
+        default: "false"
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
+
       detection_depth:
-        description: 'Snyk recursive project detection depth'
+        description: "Snyk --detection-depth value"
         required: true
-        default: '10'
-        type: string
+        default: "10"
+        type: choice
+        options:
+          - "4"
+          - "6"
+          - "8"
+          - "10"
+          - "12"
 
   push:
     paths:
-      - 'customer-software/**'
-      - '.github/workflows/scan.yml'
+      - "customer-software/**"
+      - ".github/workflows/scan.yml"
 
 permissions:
   contents: write
   actions: read
 
-concurrency:
-  group: security-scan-${{ github.ref }}
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: bash
-
 env:
+  CUSTOMER_SOFTWARE_DIR: customer-software
   EXTRACTED_DIR: /tmp/extracted
   REPORTS_DIR: reports
-  SNYK_MONITOR_ENABLED: ${{ github.event.inputs.snyk_monitor || 'true' }}
-  COMMIT_REPORTS_ENABLED: ${{ github.event.inputs.commit_reports || 'true' }}
-  CREATE_RELEASE_ENABLED: ${{ github.event.inputs.create_release || 'true' }}
-  SNYK_DETECTION_DEPTH: ${{ github.event.inputs.detection_depth || '10' }}
+  SNYK_DETECTION_DEPTH: ${{ inputs.detection_depth || '10' }}
+  SNYK_MONITOR_ENABLED: ${{ inputs.snyk_monitor || 'true' }}
+  SNYK_UNMANAGED_ENABLED: ${{ inputs.snyk_unmanaged_fallback || 'true' }}
+  COMMIT_REPORTS_ENABLED: ${{ inputs.commit_reports || 'true' }}
+  CREATE_RELEASE_ENABLED: ${{ inputs.create_release || 'false' }}
 
 jobs:
-  ##############################################################################
-  # JOB 1: SAFELY EXTRACT CUSTOMER SOFTWARE
-  ##############################################################################
-  prepare-source:
-    name: Prepare Source
+  prepare-extracted-code:
+    name: Prepare Extracted Customer Code
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Safely extract uploaded customer software
+      - name: Extract customer ZIP files safely
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "Preparing extracted source workspace: ${EXTRACTED_DIR}"
-          rm -rf "${EXTRACTED_DIR}"
           mkdir -p "${EXTRACTED_DIR}"
-          mkdir -p scan-metadata
+          mkdir -p out
 
-          python3 - <<'PY'
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch/ref: ${{ github.ref_name }}"
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+          echo "Customer software directory: ${CUSTOMER_SOFTWARE_DIR}"
+          echo "Extraction directory: ${EXTRACTED_DIR}"
+
+          if [ ! -d "${CUSTOMER_SOFTWARE_DIR}" ]; then
+            echo "ERROR: ${CUSTOMER_SOFTWARE_DIR} does not exist." | tee out/extraction-error.txt
+            exit 1
+          fi
+
+          python3 <<'PY'
           import json
           import os
           import pathlib
           import shutil
           import zipfile
-          from datetime import datetime, timezone
 
-          source_dir = pathlib.Path('customer-software')
-          dest_dir = pathlib.Path(os.environ['EXTRACTED_DIR']).resolve()
-          metadata_dir = pathlib.Path('scan-metadata')
-          metadata_dir.mkdir(exist_ok=True)
+          src = pathlib.Path(os.environ["CUSTOMER_SOFTWARE_DIR"]).resolve()
+          dst = pathlib.Path(os.environ["EXTRACTED_DIR"]).resolve()
+          dst.mkdir(parents=True, exist_ok=True)
 
           summary = {
-              'generated_utc': datetime.now(timezone.utc).isoformat(),
-              'source_dir': str(source_dir),
-              'extracted_dir': str(dest_dir),
-              'zip_files': [],
-              'copied_files_mode': False,
-              'rejected_entries': [],
-              'extracted_file_count': 0,
-              'manifest_candidates': []
+              "source_directory": str(src),
+              "extraction_directory": str(dst),
+              "zip_files_found": [],
+              "zip_files_extracted": [],
+              "non_zip_content_copied": False,
+              "errors": []
           }
 
-          if not source_dir.exists():
-              raise SystemExit('customer-software/ does not exist')
+          def safe_extract_zip(zip_path: pathlib.Path, target_dir: pathlib.Path):
+              target_dir.mkdir(parents=True, exist_ok=True)
+              target_root = target_dir.resolve()
 
-          zip_files = sorted(source_dir.glob('*.zip'))
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  for member in zf.infolist():
+                      member_target = (target_root / member.filename).resolve()
 
-          def safe_extract_zip(zip_path: pathlib.Path, destination: pathlib.Path):
-              with zipfile.ZipFile(zip_path) as archive:
-                  for member in archive.infolist():
-                      member_name = member.filename
-                      target_path = (destination / member_name).resolve()
-                      # Block Zip Slip: absolute paths and ../ traversal.
-                      if target_path != destination and not str(target_path).startswith(str(destination) + os.sep):
-                          summary['rejected_entries'].append({
-                              'zip': str(zip_path),
-                              'entry': member_name,
-                              'reason': 'unsafe path traversal or absolute path'
-                          })
-                          continue
-                      archive.extract(member, destination)
+                      if not str(member_target).startswith(str(target_root) + os.sep) and member_target != target_root:
+                          raise RuntimeError(f"Unsafe ZIP path detected: {member.filename}")
 
-          if zip_files:
-              for zip_file in zip_files:
-                  print(f'Extracting ZIP: {zip_file}')
-                  summary['zip_files'].append(str(zip_file))
-                  safe_extract_zip(zip_file, dest_dir)
-          else:
-              print('No ZIP files found. Copying non-ZIP customer-software contents.')
-              summary['copied_files_mode'] = True
-              for item in source_dir.iterdir():
-                  if item.name.lower() in {'upload_here.md', '.gitkeep'}:
-                      continue
-                  target = dest_dir / item.name
-                  if item.is_dir():
-                      shutil.copytree(item, target, dirs_exist_ok=True)
-                  elif item.is_file():
-                      shutil.copy2(item, target)
+                  zf.extractall(target_root)
 
-          manifest_names = {
-              'requirements.txt', 'requirements-dev.txt', 'requirements-test.txt',
-              'pyproject.toml', 'setup.py', 'setup.cfg', 'Pipfile', 'Pipfile.lock',
-              'poetry.lock', 'package.json', 'package-lock.json', 'yarn.lock',
-              'pnpm-lock.yaml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
-              'go.mod', 'go.sum', 'Gemfile', 'Gemfile.lock', 'composer.json',
-              'composer.lock', 'Cargo.toml', 'Cargo.lock', 'Dockerfile'
-          }
+          zip_files = sorted(src.rglob("*.zip"))
+          summary["zip_files_found"] = [str(p.relative_to(src)) for p in zip_files]
 
-          file_count = 0
-          for path in sorted(dest_dir.rglob('*')):
-              if path.is_file():
-                  file_count += 1
-                  if path.name in manifest_names or path.suffix == '.csproj':
-                      summary['manifest_candidates'].append(str(path))
+          for index, zip_path in enumerate(zip_files, start=1):
+              target_name = f"{index:02d}-{zip_path.stem}"
+              target_dir = dst / target_name
 
-          summary['extracted_file_count'] = file_count
+              try:
+                  safe_extract_zip(zip_path, target_dir)
+                  summary["zip_files_extracted"].append({
+                      "zip": str(zip_path.relative_to(src)),
+                      "target": str(target_dir)
+                  })
+              except Exception as exc:
+                  summary["errors"].append({
+                      "zip": str(zip_path),
+                      "error": str(exc)
+                  })
 
-          (metadata_dir / 'extraction-summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
-          (metadata_dir / 'extracted-file-list.txt').write_text(
-              '\n'.join(str(p) for p in sorted(dest_dir.rglob('*')) if p.is_file()),
-              encoding='utf-8'
-          )
-          (metadata_dir / 'manifest-candidates.txt').write_text(
-              '\n'.join(summary['manifest_candidates']),
-              encoding='utf-8'
+          # Browser-friendly fallback:
+          # If someone uploads already-extracted source under customer-software/,
+          # copy non-ZIP content into /tmp/extracted/repository-content.
+          repository_content = dst / "repository-content"
+          copied_any = False
+
+          for item in src.iterdir():
+              if item.name.startswith(".git"):
+                  continue
+              if item.is_file() and item.suffix.lower() == ".zip":
+                  continue
+
+              target = repository_content / item.name
+
+              if item.is_dir():
+                  shutil.copytree(item, target, dirs_exist_ok=True)
+                  copied_any = True
+              elif item.is_file():
+                  repository_content.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(item, target)
+                  copied_any = True
+
+          summary["non_zip_content_copied"] = copied_any
+
+          pathlib.Path("out").mkdir(exist_ok=True)
+          pathlib.Path("out/extraction-summary.json").write_text(
+              json.dumps(summary, indent=2),
+              encoding="utf-8"
           )
 
-          print(f'Extracted file count: {file_count}')
-          print(f'Manifest candidates: {len(summary["manifest_candidates"])}')
-          if summary['rejected_entries']:
-              print(f'Rejected unsafe ZIP entries: {len(summary["rejected_entries"])}')
+          if summary["errors"]:
+              print(json.dumps(summary, indent=2))
+              raise SystemExit(1)
+
+          print(json.dumps(summary, indent=2))
           PY
 
-          echo "Extraction summary:"
-          cat scan-metadata/extraction-summary.json
+      - name: Build extraction debug inventory
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
 
-      - name: Upload extracted source artifact
+          echo "---- Extracted tree ----" | tee out/extracted-tree.txt
+          find "${EXTRACTED_DIR}" -maxdepth 12 -type f | sort | tee -a out/extracted-tree.txt || true
+
+          echo "---- Manifest candidates ----" | tee out/manifest-candidates.txt
+          find "${EXTRACTED_DIR}" -maxdepth 14 -type f \( \
+            -iname "requirements*.txt" -o \
+            -iname "pyproject.toml" -o \
+            -iname "poetry.lock" -o \
+            -iname "Pipfile" -o \
+            -iname "Pipfile.lock" -o \
+            -iname "setup.py" -o \
+            -iname "setup.cfg" -o \
+            -iname "package.json" -o \
+            -iname "package-lock.json" -o \
+            -iname "yarn.lock" -o \
+            -iname "pnpm-lock.yaml" -o \
+            -iname "pom.xml" -o \
+            -iname "build.gradle" -o \
+            -iname "build.gradle.kts" -o \
+            -iname "*.csproj" -o \
+            -iname "packages.config" -o \
+            -iname "go.mod" -o \
+            -iname "go.sum" -o \
+            -iname "Gemfile" -o \
+            -iname "Gemfile.lock" -o \
+            -iname "composer.json" -o \
+            -iname "composer.lock" -o \
+            -iname "Cargo.toml" -o \
+            -iname "Cargo.lock" -o \
+            -iname "Dockerfile" -o \
+            -iname "*.tf" \
+          \) -print | sort | tee -a out/manifest-candidates.txt || true
+
+          echo "---- Directory size ----" | tee out/extracted-size.txt
+          du -sh "${EXTRACTED_DIR}" | tee -a out/extracted-size.txt || true
+
+      - name: Upload extracted customer code artifact
         uses: actions/upload-artifact@v4
         with:
           name: extracted-code
-          path: ${{ env.EXTRACTED_DIR }}
-          retention-days: 7
-          if-no-files-found: error
+          path: /tmp/extracted
+          retention-days: 14
 
-      - name: Upload extraction metadata artifact
+      - name: Upload extraction debug artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: extracted-metadata
-          path: scan-metadata
-          retention-days: 30
-          if-no-files-found: error
+          name: extraction-debug
+          path: out/
+          retention-days: 14
 
-  ##############################################################################
-  # JOB 2: GENERATE SBOM WITH SYFT
-  ##############################################################################
-  generate-sbom:
-    name: Generate SBOM
+  syft-sbom:
+    name: Generate SBOM with Syft
     runs-on: ubuntu-latest
-    needs: prepare-source
+    needs: prepare-extracted-code
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download extracted source
+      - name: Download extracted customer code
         uses: actions/download-artifact@v4
         with:
           name: extracted-code
-          path: ${{ env.EXTRACTED_DIR }}
+          path: /tmp/extracted
 
-      - name: Generate SPDX SBOM with Syft
-        id: syft
-        continue-on-error: true
-        uses: anchore/sbom-action@v0
-        with:
-          path: ${{ env.EXTRACTED_DIR }}
-          format: spdx-json
-          output-file: sbom-spdx.json
-
-      - name: Normalize SBOM output
-        if: always()
+      - name: Generate SPDX SBOM
+        shell: bash
         run: |
           mkdir -p out
-          if [ -s sbom-spdx.json ]; then
-            cp sbom-spdx.json out/sbom-spdx.json
-            echo '{"scanner":"syft","status":"EXECUTED"}' > out/sbom-status.json
+
+          set +e
+
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh -o /tmp/install_syft.sh
+          DOWNLOAD_EXIT=$?
+
+          if [ "${DOWNLOAD_EXIT}" -eq 0 ]; then
+            sudo sh /tmp/install_syft.sh -b /usr/local/bin > out/syft-install.log 2>&1
+            INSTALL_EXIT=$?
           else
-            cat > out/sbom-spdx.json <<'JSON'
-          {
-            "scanner": "syft",
-            "status": "NO_VALID_OUTPUT",
-            "reason": "Syft did not produce a non-empty SPDX JSON file. Review workflow logs."
-          }
-          JSON
-            cat > out/sbom-status.json <<'JSON'
-          {"scanner":"syft","status":"NO_VALID_OUTPUT"}
-          JSON
+            INSTALL_EXIT="${DOWNLOAD_EXIT}"
+            echo "Failed to download Syft installer." > out/syft-install.log
           fi
 
-      - name: Upload SBOM results
+          if command -v syft >/dev/null 2>&1; then
+            syft version > out/syft-version.txt 2>&1
+            syft dir:/tmp/extracted -o spdx-json=out/sbom-spdx.json > out/syft.log 2>&1
+            SYFT_EXIT=$?
+          else
+            SYFT_EXIT=127
+            echo '{"scanner":"syft","status":"NOT_EXECUTED","reason":"Syft was not installed."}' > out/sbom-spdx.json
+            echo "Syft command not found." > out/syft.log
+          fi
+
+          set -e
+
+          cat > out/syft-status.json <<JSON
+          {
+            "scanner": "syft",
+            "command": "syft dir:/tmp/extracted -o spdx-json",
+            "download_exit_code": ${DOWNLOAD_EXIT},
+            "install_exit_code": ${INSTALL_EXIT},
+            "scan_exit_code": ${SYFT_EXIT}
+          }
+          JSON
+
+      - name: Upload SBOM artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sbom-results
-          path: out
-          retention-days: 30
-          if-no-files-found: error
+          path: out/
+          retention-days: 14
 
-  ##############################################################################
-  # JOB 3: SCA WITH SNYK AND GRYPE
-  ##############################################################################
-  sca-scan:
-    name: SCA - Snyk and Grype
+  snyk-sca:
+    name: Snyk Open Source Scan and Monitor
     runs-on: ubuntu-latest
-    needs: prepare-source
+    needs: prepare-extracted-code
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download extracted source
+      - name: Download extracted customer code
         uses: actions/download-artifact@v4
         with:
           name: extracted-code
-          path: ${{ env.EXTRACTED_DIR }}
+          path: /tmp/extracted
 
       - name: Set up Snyk CLI
+        continue-on-error: true
         uses: snyk/actions/setup@master
 
-      - name: Debug manifest detection before Snyk
-        run: |
-          mkdir -p out
-          echo "Extracted directory: ${EXTRACTED_DIR}"
-          echo "Snyk detection depth: ${SNYK_DETECTION_DEPTH}"
-          echo "Repository: ${{ github.repository }}"
-          echo "Branch/ref: ${{ github.ref_name }}"
-          echo "Files under extracted source:"
-          find "${EXTRACTED_DIR}" -maxdepth 8 -type f | sort | tee out/snyk-debug-file-list.txt
-          echo "Manifest candidates:"
-          find "${EXTRACTED_DIR}" -maxdepth 12 -type f \( \
-            -name "requirements*.txt" -o \
-            -name "pyproject.toml" -o \
-            -name "setup.py" -o \
-            -name "setup.cfg" -o \
-            -name "Pipfile" -o \
-            -name "Pipfile.lock" -o \
-            -name "poetry.lock" -o \
-            -name "package.json" -o \
-            -name "package-lock.json" -o \
-            -name "yarn.lock" -o \
-            -name "pnpm-lock.yaml" -o \
-            -name "pom.xml" -o \
-            -name "build.gradle" -o \
-            -name "build.gradle.kts" -o \
-            -name "*.csproj" -o \
-            -name "go.mod" -o \
-            -name "Gemfile" -o \
-            -name "composer.json" -o \
-            -name "Cargo.toml" -o \
-            -name "Dockerfile" \
-          \) -print | sort | tee out/snyk-manifest-candidates.txt
-
-      - name: Run Snyk Open Source test against extracted code
-        if: always()
-        continue-on-error: true
+      - name: Run Snyk test and monitor from extracted code
+        shell: bash
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_ORG_ID: ${{ secrets.SNYK_ORG_ID }}
         run: |
           mkdir -p out
+
+          echo "Snyk detection depth: ${SNYK_DETECTION_DEPTH}"
+          echo "Snyk monitor enabled: ${SNYK_MONITOR_ENABLED}"
+          echo "Snyk unmanaged enabled: ${SNYK_UNMANAGED_ENABLED}"
+          echo "Extracted directory: ${EXTRACTED_DIR}"
+
+          find "${EXTRACTED_DIR}" -maxdepth 14 -type f \( \
+            -iname "requirements*.txt" -o \
+            -iname "pyproject.toml" -o \
+            -iname "poetry.lock" -o \
+            -iname "Pipfile" -o \
+            -iname "Pipfile.lock" -o \
+            -iname "setup.py" -o \
+            -iname "package.json" -o \
+            -iname "package-lock.json" -o \
+            -iname "pom.xml" -o \
+            -iname "build.gradle" -o \
+            -iname "*.csproj" -o \
+            -iname "go.mod" -o \
+            -iname "Gemfile" -o \
+            -iname "composer.json" -o \
+            -iname "Cargo.toml" \
+          \) -print | sort > out/snyk-manifest-candidates.txt || true
 
           if [ -z "${SNYK_TOKEN:-}" ]; then
             cat > out/snyk-results.json <<'JSON'
           {
             "scanner": "snyk",
+            "command": "test",
             "status": "NOT_EXECUTED",
-            "reason": "Repository secret SNYK_TOKEN is not configured."
+            "reason": "GitHub secret SNYK_TOKEN is not configured."
           }
           JSON
-            echo '{"scanner":"snyk","command":"test","status":"NOT_EXECUTED","reason":"Missing SNYK_TOKEN"}' > out/snyk-test-status.json
-            exit 0
-          fi
 
-          set +e
-          cd "${EXTRACTED_DIR}"
-          snyk --version | tee "${GITHUB_WORKSPACE}/out/snyk-version.txt"
-          snyk test \
-            --all-projects \
-            --detection-depth="${SNYK_DETECTION_DEPTH}" \
-            --json-file-output="${GITHUB_WORKSPACE}/out/snyk-results.json" \
-            --remote-repo-url="https://github.com/${{ github.repository }}" \
-            --target-reference="${{ github.ref_name }}"
-          SNYK_EXIT=$?
-          set -e
-
-          cd "${GITHUB_WORKSPACE}"
-          if [ ! -s out/snyk-results.json ]; then
-            cat > out/snyk-results.json <<JSON
+            cat > out/snyk-test-status.json <<'JSON'
           {
             "scanner": "snyk",
-            "status": "NO_VALID_OUTPUT",
-            "exit_code": ${SNYK_EXIT},
-            "reason": "snyk test did not produce JSON output. Exit code 3 usually means no supported projects detected."
+            "command": "test",
+            "status": "NOT_EXECUTED",
+            "reason": "Missing SNYK_TOKEN"
           }
           JSON
-          fi
 
-          cat > out/snyk-test-status.json <<JSON
-          {"scanner":"snyk","command":"test","status":"COMPLETED_WITH_EXIT_CODE","exit_code":${SNYK_EXIT}}
+            cat > out/snyk-monitor-status.json <<'JSON'
+          {
+            "scanner": "snyk",
+            "command": "monitor",
+            "status": "NOT_EXECUTED",
+            "reason": "Missing SNYK_TOKEN"
+          }
           JSON
 
-      - name: Run Snyk monitor to publish projects into Snyk UI
-        if: always()
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: |
-          mkdir -p out
-
-          if [ "${SNYK_MONITOR_ENABLED}" != "true" ]; then
-            echo '{"scanner":"snyk","command":"monitor","status":"SKIPPED","reason":"snyk_monitor input disabled"}' > out/snyk-monitor-status.json
             exit 0
           fi
 
-          if [ -z "${SNYK_TOKEN:-}" ]; then
-            echo '{"scanner":"snyk","command":"monitor","status":"NOT_EXECUTED","reason":"Missing SNYK_TOKEN"}' > out/snyk-monitor-status.json
+          if ! command -v snyk >/dev/null 2>&1; then
+            cat > out/snyk-results.json <<'JSON'
+          {
+            "scanner": "snyk",
+            "command": "test",
+            "status": "NOT_EXECUTED",
+            "reason": "Snyk CLI was not installed."
+          }
+          JSON
+
+            cat > out/snyk-test-status.json <<'JSON'
+          {
+            "scanner": "snyk",
+            "command": "test",
+            "status": "NOT_EXECUTED",
+            "reason": "Snyk CLI command not found"
+          }
+          JSON
+
             exit 0
+          fi
+
+          snyk --version > out/snyk-version.txt 2>&1 || true
+
+          ORG_ARGS=()
+          if [ -n "${SNYK_ORG_ID:-}" ]; then
+            ORG_ARGS+=(--org="${SNYK_ORG_ID}")
           fi
 
           set +e
+
           cd "${EXTRACTED_DIR}"
-          snyk monitor \
+
+          snyk test \
+            "${ORG_ARGS[@]}" \
             --all-projects \
             --detection-depth="${SNYK_DETECTION_DEPTH}" \
             --remote-repo-url="https://github.com/${{ github.repository }}" \
             --target-reference="${{ github.ref_name }}" \
-            > "${GITHUB_WORKSPACE}/out/snyk-monitor.log" 2>&1
-          MONITOR_EXIT=$?
-          set -e
+            --json-file-output="${GITHUB_WORKSPACE}/out/snyk-results.json" \
+            > "${GITHUB_WORKSPACE}/out/snyk-test.log" 2>&1
 
-          cd "${GITHUB_WORKSPACE}"
-          cat > out/snyk-monitor-status.json <<JSON
-          {"scanner":"snyk","command":"monitor","status":"COMPLETED_WITH_EXIT_CODE","exit_code":${MONITOR_EXIT}}
-          JSON
+          SNYK_TEST_EXIT=$?
 
-      - name: Run Grype vulnerability scan
-        id: grype
-        continue-on-error: true
-        uses: anchore/scan-action@v3
-        with:
-          path: ${{ env.EXTRACTED_DIR }}
-          output-format: json
-          output-file: out/grype-results.json
-          fail-build: false
-
-      - name: Normalize Grype output
-        if: always()
-        run: |
-          mkdir -p out
-          if [ -s out/grype-results.json ]; then
-            echo '{"scanner":"grype","status":"EXECUTED"}' > out/grype-status.json
-          else
-            cat > out/grype-results.json <<'JSON'
+          if [ ! -s "${GITHUB_WORKSPACE}/out/snyk-results.json" ]; then
+            cat > "${GITHUB_WORKSPACE}/out/snyk-results.json" <<JSON
           {
-            "scanner": "grype",
+            "scanner": "snyk",
+            "command": "test --all-projects",
             "status": "NO_VALID_OUTPUT",
-            "reason": "Grype did not produce a non-empty JSON file. Review workflow logs."
+            "exit_code": ${SNYK_TEST_EXIT},
+            "reason": "Snyk did not produce JSON output. Exit code 3 commonly means no supported projects were detected."
           }
           JSON
-            echo '{"scanner":"grype","status":"NO_VALID_OUTPUT"}' > out/grype-status.json
           fi
 
-      - name: Upload SCA results
+          UNMANAGED_TEST_EXIT="not_run"
+          if [ "${SNYK_UNMANAGED_ENABLED}" = "true" ]; then
+            snyk test \
+              "${ORG_ARGS[@]}" \
+              --unmanaged \
+              --remote-repo-url="https://github.com/${{ github.repository }}" \
+              --target-reference="${{ github.ref_name }}" \
+              --json-file-output="${GITHUB_WORKSPACE}/out/snyk-unmanaged-results.json" \
+              > "${GITHUB_WORKSPACE}/out/snyk-unmanaged-test.log" 2>&1
+
+            UNMANAGED_TEST_EXIT=$?
+
+            if [ ! -s "${GITHUB_WORKSPACE}/out/snyk-unmanaged-results.json" ]; then
+              cat > "${GITHUB_WORKSPACE}/out/snyk-unmanaged-results.json" <<JSON
+          {
+            "scanner": "snyk",
+            "command": "test --unmanaged",
+            "status": "NO_VALID_OUTPUT",
+            "exit_code": ${UNMANAGED_TEST_EXIT}
+          }
+          JSON
+            fi
+          fi
+
+          MONITOR_EXIT="not_run"
+          UNMANAGED_MONITOR_EXIT="not_run"
+
+          if [ "${SNYK_MONITOR_ENABLED}" = "true" ]; then
+            snyk monitor \
+              "${ORG_ARGS[@]}" \
+              --all-projects \
+              --detection-depth="${SNYK_DETECTION_DEPTH}" \
+              --remote-repo-url="https://github.com/${{ github.repository }}" \
+              --target-reference="${{ github.ref_name }}" \
+              > "${GITHUB_WORKSPACE}/out/snyk-monitor.log" 2>&1
+
+            MONITOR_EXIT=$?
+
+            if [ "${SNYK_UNMANAGED_ENABLED}" = "true" ]; then
+              snyk monitor \
+                "${ORG_ARGS[@]}" \
+                --unmanaged \
+                --remote-repo-url="https://github.com/${{ github.repository }}" \
+                --target-reference="${{ github.ref_name }}" \
+                > "${GITHUB_WORKSPACE}/out/snyk-unmanaged-monitor.log" 2>&1
+
+              UNMANAGED_MONITOR_EXIT=$?
+            fi
+          else
+            echo "Snyk monitor skipped because SNYK_MONITOR_ENABLED is false." > "${GITHUB_WORKSPACE}/out/snyk-monitor.log"
+          fi
+
+          cd "${GITHUB_WORKSPACE}"
+
+          set -e
+
+          cat > out/snyk-test-status.json <<JSON
+          {
+            "scanner": "snyk",
+            "command": "test",
+            "all_projects_exit_code": "${SNYK_TEST_EXIT}",
+            "unmanaged_exit_code": "${UNMANAGED_TEST_EXIT}"
+          }
+          JSON
+
+          cat > out/snyk-monitor-status.json <<JSON
+          {
+            "scanner": "snyk",
+            "command": "monitor",
+            "monitor_enabled": "${SNYK_MONITOR_ENABLED}",
+            "all_projects_exit_code": "${MONITOR_EXIT}",
+            "unmanaged_exit_code": "${UNMANAGED_MONITOR_EXIT}"
+          }
+          JSON
+
+      - name: Upload Snyk artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sca-results
-          path: out
-          retention-days: 30
-          if-no-files-found: error
+          name: snyk-results
+          path: out/
+          retention-days: 14
 
-  ##############################################################################
-  # JOB 4: SAST WITH SEMGREP COMMUNITY RULES
-  ##############################################################################
-  sast-semgrep:
-    name: SAST - Semgrep
+  grype-sca:
+    name: Grype Vulnerability Scan
     runs-on: ubuntu-latest
-    needs: prepare-source
+    needs: prepare-extracted-code
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download extracted source
+      - name: Download extracted customer code
         uses: actions/download-artifact@v4
         with:
           name: extracted-code
-          path: ${{ env.EXTRACTED_DIR }}
+          path: /tmp/extracted
 
-      - name: Install Semgrep
-        continue-on-error: true
-        run: |
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user semgrep
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Run Semgrep against extracted code
-        continue-on-error: true
+      - name: Run Grype filesystem scan
+        shell: bash
         run: |
           mkdir -p out
-          if ! command -v semgrep >/dev/null 2>&1; then
-            cat > out/semgrep-results.json <<'JSON'
-          {
-            "scanner": "semgrep",
-            "status": "NOT_EXECUTED",
-            "reason": "Semgrep was not installed successfully."
-          }
-          JSON
-            echo '{"scanner":"semgrep","status":"NOT_EXECUTED"}' > out/semgrep-status.json
-            exit 0
-          fi
 
           set +e
-          semgrep scan \
-            --config p/default \
-            --json \
-            --output out/semgrep-results.json \
-            "${EXTRACTED_DIR}"
-          SEMGREP_EXIT=$?
-          set -e
 
-          if [ ! -s out/semgrep-results.json ]; then
-            cat > out/semgrep-results.json <<JSON
-          {
-            "scanner": "semgrep",
-            "status": "NO_VALID_OUTPUT",
-            "exit_code": ${SEMGREP_EXIT},
-            "reason": "Semgrep did not produce JSON output. Review workflow logs."
-          }
-          JSON
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh -o /tmp/install_grype.sh
+          DOWNLOAD_EXIT=$?
+
+          if [ "${DOWNLOAD_EXIT}" -eq 0 ]; then
+            sudo sh /tmp/install_grype.sh -b /usr/local/bin > out/grype-install.log 2>&1
+            INSTALL_EXIT=$?
+          else
+            INSTALL_EXIT="${DOWNLOAD_EXIT}"
+            echo "Failed to download Grype installer." > out/grype-install.log
           fi
 
-          cat > out/semgrep-status.json <<JSON
-          {"scanner":"semgrep","status":"COMPLETED_WITH_EXIT_CODE","exit_code":${SEMGREP_EXIT}}
+          if command -v grype >/dev/null 2>&1; then
+            grype version > out/grype-version.txt 2>&1
+            grype dir:/tmp/extracted -o json > out/grype-results.json 2> out/grype.log
+            GRYPE_EXIT=$?
+          else
+            GRYPE_EXIT=127
+            echo '{"scanner":"grype","status":"NOT_EXECUTED","reason":"Grype was not installed."}' > out/grype-results.json
+            echo "Grype command not found." > out/grype.log
+          fi
+
+          set -e
+
+          cat > out/grype-status.json <<JSON
+          {
+            "scanner": "grype",
+            "command": "grype dir:/tmp/extracted -o json",
+            "download_exit_code": ${DOWNLOAD_EXIT},
+            "install_exit_code": ${INSTALL_EXIT},
+            "scan_exit_code": ${GRYPE_EXIT}
+          }
           JSON
 
-      - name: Upload Semgrep results
+      - name: Upload Grype artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sast-semgrep-results
-          path: out
-          retention-days: 30
-          if-no-files-found: error
+          name: grype-results
+          path: out/
+          retention-days: 14
 
-  ##############################################################################
-  # JOB 5: CONSOLIDATE REPORTS, COMMIT ONCE, AND RELEASE
-  ##############################################################################
-  generate-report:
-    name: Generate Final Report
+  semgrep-sast:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+    needs: prepare-extracted-code
+
+    steps:
+      - name: Download extracted customer code
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-code
+          path: /tmp/extracted
+
+      - name: Run Semgrep scan
+        shell: bash
+        run: |
+          mkdir -p out
+
+          set +e
+
+          python3 -m pip install --user --upgrade semgrep > out/semgrep-install.log 2>&1
+          INSTALL_EXIT=$?
+
+          export PATH="${HOME}/.local/bin:${PATH}"
+
+          if command -v semgrep >/dev/null 2>&1; then
+            semgrep --version > out/semgrep-version.txt 2>&1
+
+            semgrep scan \
+              --config=p/ci \
+              --json \
+              --output=out/semgrep-results.json \
+              /tmp/extracted \
+              > out/semgrep.log 2>&1
+
+            SEMGREP_EXIT=$?
+          else
+            SEMGREP_EXIT=127
+            echo '{"scanner":"semgrep","status":"NOT_EXECUTED","reason":"Semgrep was not installed."}' > out/semgrep-results.json
+            echo "Semgrep command not found." > out/semgrep.log
+          fi
+
+          set -e
+
+          cat > out/semgrep-status.json <<JSON
+          {
+            "scanner": "semgrep",
+            "command": "semgrep scan --config=p/ci",
+            "install_exit_code": ${INSTALL_EXIT},
+            "scan_exit_code": ${SEMGREP_EXIT}
+          }
+          JSON
+
+      - name: Upload Semgrep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: out/
+          retention-days: 14
+
+  consolidate-reports:
+    name: Consolidate Reports
     runs-on: ubuntu-latest
     needs:
-      - prepare-source
-      - generate-sbom
-      - sca-scan
-      - sast-semgrep
+      - prepare-extracted-code
+      - syft-sbom
+      - snyk-sca
+      - grype-sca
+      - semgrep-sast
     if: always()
 
     steps:
@@ -543,234 +688,283 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync branch before report generation
-        run: |
-          git fetch origin
-          git reset --hard "origin/${{ github.ref_name }}"
-
-      - name: Download all scanner artifacts
+      - name: Download extraction debug artifact
         uses: actions/download-artifact@v4
         with:
-          path: artifact-downloads
+          name: extraction-debug
+          path: incoming/extraction-debug
 
-      - name: Consolidate scanner outputs
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-results
+          path: incoming/sbom-results
+
+      - name: Download Snyk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: snyk-results
+          path: incoming/snyk-results
+
+      - name: Download Grype artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grype-results
+          path: incoming/grype-results
+
+      - name: Download Semgrep artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: semgrep-results
+          path: incoming/semgrep-results
+
+      - name: Build reports folder
+        shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "${REPORTS_DIR}"
 
-          echo "Downloaded artifacts:"
-          find artifact-downloads -maxdepth 3 -type f | sort
+          cp incoming/extraction-debug/extraction-summary.json "${REPORTS_DIR}/extraction-summary.json" 2>/dev/null || true
+          cp incoming/extraction-debug/extracted-tree.txt "${REPORTS_DIR}/extracted-tree.txt" 2>/dev/null || true
+          cp incoming/extraction-debug/manifest-candidates.txt "${REPORTS_DIR}/manifest-candidates.txt" 2>/dev/null || true
+          cp incoming/extraction-debug/extracted-size.txt "${REPORTS_DIR}/extracted-size.txt" 2>/dev/null || true
 
-          copy_if_exists() {
-            local src="$1"
-            local dst="$2"
-            if [ -f "$src" ]; then
-              cp "$src" "$dst"
-            fi
-          }
+          cp incoming/sbom-results/sbom-spdx.json "${REPORTS_DIR}/sbom-spdx.json" 2>/dev/null || true
+          cp incoming/sbom-results/syft-status.json "${REPORTS_DIR}/syft-status.json" 2>/dev/null || true
+          cp incoming/sbom-results/syft.log "${REPORTS_DIR}/syft.log" 2>/dev/null || true
+          cp incoming/sbom-results/syft-version.txt "${REPORTS_DIR}/syft-version.txt" 2>/dev/null || true
 
-          copy_if_exists artifact-downloads/extracted-metadata/extraction-summary.json "${REPORTS_DIR}/extraction-summary.json"
-          copy_if_exists artifact-downloads/extracted-metadata/extracted-file-list.txt "${REPORTS_DIR}/extracted-file-list.txt"
-          copy_if_exists artifact-downloads/extracted-metadata/manifest-candidates.txt "${REPORTS_DIR}/manifest-candidates.txt"
+          cp incoming/snyk-results/snyk-results.json "${REPORTS_DIR}/snyk-results.json" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-unmanaged-results.json "${REPORTS_DIR}/snyk-unmanaged-results.json" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-test-status.json "${REPORTS_DIR}/snyk-test-status.json" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-monitor-status.json "${REPORTS_DIR}/snyk-monitor-status.json" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-test.log "${REPORTS_DIR}/snyk-test.log" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-monitor.log "${REPORTS_DIR}/snyk-monitor.log" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-unmanaged-test.log "${REPORTS_DIR}/snyk-unmanaged-test.log" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-unmanaged-monitor.log "${REPORTS_DIR}/snyk-unmanaged-monitor.log" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-manifest-candidates.txt "${REPORTS_DIR}/snyk-manifest-candidates.txt" 2>/dev/null || true
+          cp incoming/snyk-results/snyk-version.txt "${REPORTS_DIR}/snyk-version.txt" 2>/dev/null || true
 
-          copy_if_exists artifact-downloads/sbom-results/sbom-spdx.json "${REPORTS_DIR}/sbom-spdx.json"
-          copy_if_exists artifact-downloads/sbom-results/sbom-status.json "${REPORTS_DIR}/sbom-status.json"
+          cp incoming/grype-results/grype-results.json "${REPORTS_DIR}/grype-results.json" 2>/dev/null || true
+          cp incoming/grype-results/grype-status.json "${REPORTS_DIR}/grype-status.json" 2>/dev/null || true
+          cp incoming/grype-results/grype.log "${REPORTS_DIR}/grype.log" 2>/dev/null || true
+          cp incoming/grype-results/grype-version.txt "${REPORTS_DIR}/grype-version.txt" 2>/dev/null || true
 
-          copy_if_exists artifact-downloads/sca-results/snyk-results.json "${REPORTS_DIR}/snyk-results.json"
-          copy_if_exists artifact-downloads/sca-results/snyk-test-status.json "${REPORTS_DIR}/snyk-test-status.json"
-          copy_if_exists artifact-downloads/sca-results/snyk-monitor-status.json "${REPORTS_DIR}/snyk-monitor-status.json"
-          copy_if_exists artifact-downloads/sca-results/snyk-monitor.log "${REPORTS_DIR}/snyk-monitor.log"
-          copy_if_exists artifact-downloads/sca-results/snyk-version.txt "${REPORTS_DIR}/snyk-version.txt"
-          copy_if_exists artifact-downloads/sca-results/snyk-manifest-candidates.txt "${REPORTS_DIR}/snyk-manifest-candidates.txt"
-          copy_if_exists artifact-downloads/sca-results/snyk-debug-file-list.txt "${REPORTS_DIR}/snyk-debug-file-list.txt"
-          copy_if_exists artifact-downloads/sca-results/grype-results.json "${REPORTS_DIR}/grype-results.json"
-          copy_if_exists artifact-downloads/sca-results/grype-status.json "${REPORTS_DIR}/grype-status.json"
+          cp incoming/semgrep-results/semgrep-results.json "${REPORTS_DIR}/semgrep-results.json" 2>/dev/null || true
+          cp incoming/semgrep-results/semgrep-status.json "${REPORTS_DIR}/semgrep-status.json" 2>/dev/null || true
+          cp incoming/semgrep-results/semgrep.log "${REPORTS_DIR}/semgrep.log" 2>/dev/null || true
+          cp incoming/semgrep-results/semgrep-version.txt "${REPORTS_DIR}/semgrep-version.txt" 2>/dev/null || true
 
-          copy_if_exists artifact-downloads/sast-semgrep-results/semgrep-results.json "${REPORTS_DIR}/semgrep-results.json"
-          copy_if_exists artifact-downloads/sast-semgrep-results/semgrep-status.json "${REPORTS_DIR}/semgrep-status.json"
+          python3 <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
 
-          # Create truthful placeholders only when a scanner result is missing.
-          [ -s "${REPORTS_DIR}/sbom-spdx.json" ] || echo '{"scanner":"syft","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/sbom-spdx.json"
-          [ -s "${REPORTS_DIR}/snyk-results.json" ] || echo '{"scanner":"snyk","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/snyk-results.json"
-          [ -s "${REPORTS_DIR}/grype-results.json" ] || echo '{"scanner":"grype","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/grype-results.json"
-          [ -s "${REPORTS_DIR}/semgrep-results.json" ] || echo '{"scanner":"semgrep","status":"MISSING_OUTPUT"}' > "${REPORTS_DIR}/semgrep-results.json"
+          reports = pathlib.Path(os.environ.get("REPORTS_DIR", "reports"))
+          reports.mkdir(exist_ok=True)
 
-      - name: Generate audit-ready markdown report
-        run: |
-          set -euo pipefail
-          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          REPORT_FILE="${REPORTS_DIR}/SCA-Report-${TIMESTAMP}.md"
-          STATUS_FILE="${REPORTS_DIR}/scan-status-${TIMESTAMP}.json"
+          def read_text(name):
+              path = reports / name
+              if path.exists():
+                  return path.read_text(encoding="utf-8", errors="replace")
+              return ""
 
-          json_status() {
-            local file="$1"
-            if [ ! -s "$file" ]; then
-              echo "MISSING"
-              return
-            fi
-            if jq empty "$file" >/dev/null 2>&1; then
-              jq -r '.status? // "EXECUTED"' "$file" 2>/dev/null || echo "EXECUTED"
-            else
-              echo "INVALID_JSON"
-            fi
-          }
+          def read_json(name):
+              path = reports / name
+              if not path.exists():
+                  return None
+              try:
+                  return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+              except Exception as exc:
+                  return {"parse_error": str(exc)}
 
-          json_count() {
-            local file="$1"
-            local expr="$2"
-            if [ ! -s "$file" ] || ! jq empty "$file" >/dev/null 2>&1; then
-              echo "N/A"
-              return
-            fi
-            jq -r "$expr" "$file" 2>/dev/null || echo "N/A"
-          }
+          def file_state(name):
+              path = reports / name
+              if path.exists() and path.stat().st_size > 0:
+                  return "PRESENT"
+              return "MISSING"
 
-          SBOM_STATUS=$(json_status "${REPORTS_DIR}/sbom-spdx.json")
-          SNYK_STATUS=$(json_status "${REPORTS_DIR}/snyk-results.json")
-          GRYPE_STATUS=$(json_status "${REPORTS_DIR}/grype-results.json")
-          SEMGREP_STATUS=$(json_status "${REPORTS_DIR}/semgrep-results.json")
+          run_number = os.environ.get("GITHUB_RUN_NUMBER", "unknown")
+          repository = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "unknown")
+          sha = os.environ.get("GITHUB_SHA", "unknown")
 
-          SNYK_VULN_COUNT=$(json_count "${REPORTS_DIR}/snyk-results.json" 'if type == "array" then ([.[].vulnerabilities[]?] | length) else (.vulnerabilities? // [] | length) end')
-          GRYPE_MATCH_COUNT=$(json_count "${REPORTS_DIR}/grype-results.json" '.matches? // [] | length')
-          SEMGREP_FINDING_COUNT=$(json_count "${REPORTS_DIR}/semgrep-results.json" '.results? // [] | length')
-          SBOM_PACKAGE_COUNT=$(json_count "${REPORTS_DIR}/sbom-spdx.json" '.packages? // [] | length')
-          MANIFEST_COUNT=$(grep -cve '^$' "${REPORTS_DIR}/manifest-candidates.txt" 2>/dev/null || echo 0)
+          extraction = read_json("extraction-summary.json") or {}
+          snyk_test = read_json("snyk-test-status.json") or {}
+          snyk_monitor = read_json("snyk-monitor-status.json") or {}
+          syft = read_json("syft-status.json") or {}
+          grype = read_json("grype-status.json") or {}
+          semgrep = read_json("semgrep-status.json") or {}
 
-          cat > "$STATUS_FILE" <<JSON
-          {
-            "generated_utc": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
-            "repository": "${{ github.repository }}",
-            "run_number": "${{ github.run_number }}",
-            "run_id": "${{ github.run_id }}",
-            "sbom_status": "${SBOM_STATUS}",
-            "snyk_status": "${SNYK_STATUS}",
-            "grype_status": "${GRYPE_STATUS}",
-            "semgrep_status": "${SEMGREP_STATUS}",
-            "manifest_candidate_count": "${MANIFEST_COUNT}",
-            "sbom_package_count": "${SBOM_PACKAGE_COUNT}",
-            "snyk_vulnerability_count": "${SNYK_VULN_COUNT}",
-            "grype_match_count": "${GRYPE_MATCH_COUNT}",
-            "semgrep_finding_count": "${SEMGREP_FINDING_COUNT}"
-          }
-          JSON
+          manifest_text = read_text("manifest-candidates.txt")
+          manifest_count = len([line for line in manifest_text.splitlines() if line.strip() and not line.startswith("----")])
 
-          cat > "$REPORT_FILE" <<MD
-          # Software Security Scan Report
+          lines = []
+          lines.append(f"# Security Scan Report - Run {run_number}")
+          lines.append("")
+          lines.append(f"- Repository: `{repository}`")
+          lines.append(f"- Branch/Ref: `{ref_name}`")
+          lines.append(f"- Commit: `{sha}`")
+          lines.append(f"- Generated UTC: `{datetime.datetime.utcnow().isoformat()}Z`")
+          lines.append("")
+          lines.append("## Executive Summary")
+          lines.append("")
+          lines.append("| Component | Status | Evidence |")
+          lines.append("|---|---:|---|")
+          lines.append(f"| Extraction | {file_state('extraction-summary.json')} | `reports/extraction-summary.json` |")
+          lines.append(f"| Manifest Candidates | {manifest_count} found | `reports/manifest-candidates.txt` |")
+          lines.append(f"| Syft SBOM | {file_state('sbom-spdx.json')} | `reports/sbom-spdx.json` |")
+          lines.append(f"| Snyk Test | all-projects exit `{snyk_test.get('all_projects_exit_code', 'unknown')}`, unmanaged exit `{snyk_test.get('unmanaged_exit_code', 'unknown')}` | `reports/snyk-results.json`, `reports/snyk-unmanaged-results.json` |")
+          lines.append(f"| Snyk Monitor | all-projects exit `{snyk_monitor.get('all_projects_exit_code', 'unknown')}`, unmanaged exit `{snyk_monitor.get('unmanaged_exit_code', 'unknown')}` | `reports/snyk-monitor.log`, `reports/snyk-unmanaged-monitor.log` |")
+          lines.append(f"| Grype | scan exit `{grype.get('scan_exit_code', 'unknown')}` | `reports/grype-results.json` |")
+          lines.append(f"| Semgrep | scan exit `{semgrep.get('scan_exit_code', 'unknown')}` | `reports/semgrep-results.json` |")
+          lines.append("")
+          lines.append("## ZIP Extraction")
+          lines.append("")
+          lines.append(f"- ZIP files found: `{len(extraction.get('zip_files_found', []))}`")
+          lines.append(f"- ZIP files extracted: `{len(extraction.get('zip_files_extracted', []))}`")
+          lines.append(f"- Non-ZIP content copied: `{extraction.get('non_zip_content_copied', 'unknown')}`")
+          lines.append("")
+          lines.append("## Snyk UI Notes")
+          lines.append("")
+          lines.append("- For Snyk projects to appear in the Snyk web UI, `snyk monitor` must complete successfully.")
+          lines.append("- If `snyk monitor --all-projects` returns exit code `3`, Snyk did not detect supported package manifests.")
+          lines.append("- This workflow also runs `snyk monitor --unmanaged` when enabled, which is useful for C/C++ or source-only archives.")
+          lines.append("- Confirm that GitHub repository secrets `SNYK_TOKEN` and optionally `SNYK_ORG_ID` are configured.")
+          lines.append("")
+          lines.append("## Key Files")
+          lines.append("")
+          lines.append("- `reports/manifest-candidates.txt`")
+          lines.append("- `reports/snyk-results.json`")
+          lines.append("- `reports/snyk-unmanaged-results.json`")
+          lines.append("- `reports/snyk-monitor.log`")
+          lines.append("- `reports/snyk-unmanaged-monitor.log`")
+          lines.append("- `reports/grype-results.json`")
+          lines.append("- `reports/semgrep-results.json`")
+          lines.append("- `reports/sbom-spdx.json`")
+          lines.append("")
 
-          ## Document Information
-
-          | Field | Value |
-          |---|---|
-          | Report Date | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
-          | Report ID | SCA-${TIMESTAMP} |
-          | Repository | ${{ github.repository }} |
-          | Branch / Ref | ${{ github.ref_name }} |
-          | Workflow Run | #${{ github.run_number }} |
-          | Scanner Workflow | DoD Security Scanner v2.0 |
-          | Classification | UNCLASSIFIED |
-
-          ## Executive Summary
-
-          This workflow scanned the extracted customer software package from \`customer-software/\`. The extracted source was staged in the runner at \`${EXTRACTED_DIR}\`, scanned, and converted into persistent reports under \`${REPORTS_DIR}/\`.
-
-          ## Source Preparation
-
-          | Item | Result |
-          |---|---:|
-          | Manifest candidates detected | ${MANIFEST_COUNT} |
-          | Extraction summary | \`${REPORTS_DIR}/extraction-summary.json\` |
-          | Extracted file inventory | \`${REPORTS_DIR}/extracted-file-list.txt\` |
-          | Manifest candidate list | \`${REPORTS_DIR}/manifest-candidates.txt\` |
-
-          ## Scanner Results
-
-          | Domain | Tool | Status | Count / Evidence | Output |
-          |---|---|---|---:|---|
-          | SBOM | Syft | ${SBOM_STATUS} | Packages: ${SBOM_PACKAGE_COUNT} | \`${REPORTS_DIR}/sbom-spdx.json\` |
-          | SCA | Snyk Open Source | ${SNYK_STATUS} | Vulnerabilities: ${SNYK_VULN_COUNT} | \`${REPORTS_DIR}/snyk-results.json\` |
-          | SCA | Grype | ${GRYPE_STATUS} | Matches: ${GRYPE_MATCH_COUNT} | \`${REPORTS_DIR}/grype-results.json\` |
-          | SAST | Semgrep | ${SEMGREP_STATUS} | Findings: ${SEMGREP_FINDING_COUNT} | \`${REPORTS_DIR}/semgrep-results.json\` |
-
-          ## Snyk UI Publication
-
-          Snyk monitor setting for this run: \`${SNYK_MONITOR_ENABLED}\`.
-
-          When enabled and when \`SNYK_TOKEN\` is valid, this workflow runs \`snyk monitor\` from \`${EXTRACTED_DIR}\` so Snyk can create monitored projects from the extracted customer code. This is separate from Snyk Web GitHub Import, which only sees committed repository files.
-
-          Related evidence:
-
-          - \`${REPORTS_DIR}/snyk-test-status.json\`
-          - \`${REPORTS_DIR}/snyk-monitor-status.json\`
-          - \`${REPORTS_DIR}/snyk-monitor.log\`
-          - \`${REPORTS_DIR}/snyk-manifest-candidates.txt\`
-
-          ## Compliance Mapping
-
-          | Control Area | Evidence Generated | Status Basis |
-          |---|---|---|
-          | SBOM Generation | SPDX JSON SBOM | File exists and is non-empty; package count reported when available |
-          | Dependency / SCA Review | Snyk and Grype JSON outputs | Scanner status and vulnerability/match counts reported truthfully |
-          | Static Analysis | Semgrep JSON output | Scanner status and finding count reported truthfully |
-          | Audit Traceability | Extraction summary, file inventory, manifest list, scanner status files | Persistent artifacts committed/released for review |
-
-          ## Important Limitations
-
-          - Runtime-extracted files are not automatically committed to GitHub.
-          - Snyk Web GitHub Import will not see files under \`/tmp/extracted\` unless they are committed to the repository.
-          - This workflow intentionally uses Snyk CLI from \`/tmp/extracted\` and optionally \`snyk monitor\` to publish monitored projects to Snyk.
-          - GitHub CodeQL is not included by default because GitHub Free private repositories generally do not support GitHub code scanning alerts for private repositories.
-
-          ## Workflow Link
-
-          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          MD
-
-          echo "Generated report: ${REPORT_FILE}"
-          ls -lah "${REPORTS_DIR}"
-
-      - name: Commit reports to repository
-        if: ${{ always() && env.COMMIT_REPORTS_ENABLED == 'true' }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${REPORTS_DIR}/"
-          git commit -m "Security scan reports for run ${{ github.run_number }}" || echo "No report changes to commit"
-          git push
+          report_name = f"SCA-Report-Run-{run_number}.md"
+          (reports / report_name).write_text("\n".join(lines), encoding="utf-8")
+          (reports / "Security-Scan-Report-Latest.md").write_text("\n".join(lines), encoding="utf-8")
+          PY
 
       - name: Upload consolidated reports artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: consolidated-security-reports
-          path: reports
-          retention-days: 90
-          if-no-files-found: error
+          path: reports/
+          retention-days: 30
 
-      - name: Create release with reports
-        if: ${{ always() && env.CREATE_RELEASE_ENABLED == 'true' }}
-        uses: softprops/action-gh-release@v2
+      - name: Commit reports to repository
+        if: ${{ env.COMMIT_REPORTS_ENABLED == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add reports/
+
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Security scan reports for run ${{ github.run_number }}"
+
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin "HEAD:${{ github.ref_name }}"
+
+    create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: consolidate-reports
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == 'true' }}
+
+    steps:
+      - name: Download consolidated reports
+        uses: actions/download-artifact@v4
         with:
-          tag_name: scan-${{ github.run_number }}
-          name: Security Scan Results - Run ${{ github.run_number }}
-          body: |
-            ## Security Scan Complete
+          name: consolidated-security-reports
+          path: release-artifacts/reports
 
-            Repository: `${{ github.repository }}`
-            Branch/ref: `${{ github.ref_name }}`
-            Workflow run: `${{ github.run_number }}`
+      - name: Create release archive and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            ### Included Deliverables
-            - Extraction summary and file inventory
-            - Manifest candidate list
-            - SBOM in SPDX JSON format
-            - Snyk Open Source JSON results
-            - Snyk monitor status/log
-            - Grype JSON results
-            - Semgrep JSON results
-            - Audit-ready markdown report
+          SCAN_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          SHORT_COMMIT="${GITHUB_SHA::7}"
+          SCANNER_VERSION="v1.3 Browser-Based Snyk/Semgrep/Syft/Grype"
 
-            This release contains scanner evidence. Review scanner status fields before treating a control area as passed.
-          files: |
-            reports/*
+          zip -r "security-scan-reports-${{ github.run_number }}.zip" release-artifacts/reports
+
+          cat > release-notes.md <<EOF
+          # DoD Security Scan Complete
+
+          **Scan Date:** ${SCAN_DATE}  
+          **Commit:** ${SHORT_COMMIT}  
+          **Scanner Version:** ${SCANNER_VERSION}  
+          **Repository:** ${{ github.repository }}  
+          **Workflow Run:** ${{ github.run_number }}
+
+          ## Deliverables
+
+          - SBOM in SPDX JSON format
+          - SAST Results using Semgrep
+          - SCA Results using Snyk and Grype
+          - Snyk monitor output for Snyk UI project creation
+          - Compliance-oriented security scan report
+          - Extraction inventory and manifest-candidate evidence
+
+          ## Standards Alignment
+
+          - ✅ DISA ASD STIG evidence support
+          - ✅ NIST SP 800-53 Rev. 5 evidence support
+          - ✅ NTIA SBOM Requirements support
+          - ✅ CVSS v3.x vulnerability scoring support where provided by scanners
+
+          ## Scan Enhancements
+
+          - 🆕 Browser-only configuration supported through GitHub Actions
+          - 🆕 Customer ZIP files are extracted in GitHub Actions runtime
+          - 🆕 Snyk now scans extracted customer code instead of the wrapper repository
+          - 🆕 Snyk monitor publishes detected projects to the Snyk UI when supported manifests are found
+          - 🆕 Semgrep scans extracted customer code for SAST findings
+          - 🆕 Syft generates SBOM output from extracted customer code
+          - 🆕 Grype performs filesystem vulnerability scanning against extracted customer code
+          - 🆕 Consolidated report archive is attached to this release
+
+          ## Important Notes
+
+          This workflow is designed for a GitHub Free/private-repository scanner-wrapper model.
+
+          CodeQL is not claimed in this release because GitHub CodeQL code scanning for private repositories requires a qualifying GitHub Team or Enterprise configuration with GitHub Code Security enabled. For this workflow, SAST coverage is provided by Semgrep.
+
+          If Snyk does not show a project in the Snyk UI, review:
+
+          - \`reports/snyk-monitor-status.json\`
+          - \`reports/snyk-monitor.log\`
+          - \`reports/snyk-manifest-candidates.txt\`
+
+          Snyk project visibility depends on \`snyk monitor\` completing successfully and detecting supported project files.
+
+          ## Download
+
+          Download the attached report archive below for audit documentation.
+          EOF
+
+      - name: Create GitHub Release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "security-scan-${{ github.run_number }}" \
+            "security-scan-reports-${{ github.run_number }}.zip" \
+            --title "DoD Security Scan Complete - Run ${{ github.run_number }}" \
+            --notes-file release-notes.md
