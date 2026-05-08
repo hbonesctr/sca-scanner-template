@@ -1,1 +1,7 @@
-{"scanner":"grype","status":"NO_VALID_OUTPUT"}
+{
+  "scanner": "grype",
+  "command": "grype dir:/tmp/extracted -o json",
+  "download_exit_code": 0,
+  "install_exit_code": 0,
+  "scan_exit_code": 0
+}
