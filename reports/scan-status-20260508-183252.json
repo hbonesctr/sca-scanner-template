@@ -1,0 +1,15 @@
+{
+  "generated_utc": "2026-05-08T18:32:52Z",
+  "repository": "hbonesctr/sca-scanner-template",
+  "run_number": "36",
+  "run_id": "25572619737",
+  "sbom_status": "EXECUTED",
+  "snyk_status": "NOT_EXECUTED",
+  "grype_status": "NO_VALID_OUTPUT",
+  "semgrep_status": "EXECUTED",
+  "manifest_candidate_count": "4",
+  "sbom_package_count": "48",
+  "snyk_vulnerability_count": "0",
+  "grype_match_count": "0",
+  "semgrep_finding_count": "0"
+}
