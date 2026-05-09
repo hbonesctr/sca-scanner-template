@@ -1,6 +1,9 @@
 
- ERROR   Unavailable due to maintenance (SNYK-0099)
-Status:  503 Service Unavailable 
-Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-0099 
+ ERROR   Authentication error (SNYK-0005)
+                                                                                        
+           Unauthorized request to unmanaged service                                    
+
+Status:  401 Unauthorized 
+Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-0005 
                                                                      
-ID:      urn:snyk:interaction:57c822bf-0f2c-40c9-bcdf-6f6425ae5249 
+ID:      urn:snyk:interaction:95007835-6b5e-44b1-995c-738f1233c0d4 

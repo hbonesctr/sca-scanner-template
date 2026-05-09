@@ -1,0 +1,3 @@
+/tmp/extracted/01-pylibssh-1.4.0/pylibssh-1.4.0/docs/requirements.txt
+/tmp/extracted/01-pylibssh-1.4.0/pylibssh-1.4.0/pyproject.toml
+/tmp/extracted/01-pylibssh-1.4.0/pylibssh-1.4.0/requirements-build.txt

@@ -2,6 +2,6 @@
   "scanner": "snyk",
   "command": "monitor",
   "monitor_enabled": "true",
-  "all_projects_exit_code": "75",
-  "unmanaged_exit_code": "75"
+  "all_projects_exit_code": "2",
+  "unmanaged_exit_code": "0"
 }

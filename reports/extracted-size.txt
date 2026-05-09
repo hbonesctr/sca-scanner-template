@@ -1,2 +1,2 @@
 ---- Directory size ----
-12K	/tmp/extracted
+892K	/tmp/extracted
