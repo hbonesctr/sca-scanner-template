@@ -921,7 +921,7 @@ jobs:
           SCANNER_VERSION="v2.3 Browser-Based Snyk/Semgrep/Syft/Grype"
           ARCHIVE_NAME="security-scan-reports-${{ github.run_number }}.zip"
 
-          zip -r "${ARCHIVE_NAME}" release-artifacts/reports
+          zip -r "${ARCHIVE_NAME}" release-artifacts/reports REFERENCES.md COMPLIANCE-OVERVIEW.md
 
           cat > release-notes.md <<EOF
           # DoD Security Scan Complete
