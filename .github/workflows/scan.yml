@@ -67,7 +67,7 @@ on:
       create_release:
         description: "Create a GitHub Release containing the scan reports"
         required: true
-        default: "false"
+        default: "true"
         type: choice
         options:
           - "true"
