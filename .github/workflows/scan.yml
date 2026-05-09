@@ -976,3 +976,150 @@ jobs:
             "security-scan-reports-${{ github.run_number }}.zip" \
             --title "DoD Security Scan Complete - Run ${{ github.run_number }}" \
             --notes-file release-notes.md
+################################################################################
+# APPEND THIS JOB TO scan.yml — after the create-release job
+#
+# DoD Security Scanner — Report Generation Job
+# Version: 1.0
+# Compatible with: DoD Security Scanner v2.3
+#
+# What this adds:
+# - Reads consolidated scan reports from the consolidated-security-reports artifact
+# - Reads cia-profile.yaml from the scanned repository root (if present)
+# - Generates 9 report files: Developer/Analyst/Leadership × DOCX/HTML/Markdown
+# - Uploads reports as a GitHub Actions artifact (security-reports-RUN#)
+# - Attaches reports to the GitHub Release created by create-release
+#
+# Prerequisites:
+# - pip: python-docx, jinja2, pyyaml (installed inline — no Docker required)
+# - scripts/generate_reports.py  (add this file to your scanner template repo)
+# - scripts/requirements-reports.txt (add this file to your scanner template repo)
+# - cia-profile.yaml in root of SCANNED repository (optional, defaults used if absent)
+#
+# Artifact retention: configured in cia-profile.yaml (default: 90 days, max: 90)
+################################################################################
+
+  generate-security-reports:
+    name: Generate Security Reports
+    runs-on: ubuntu-latest
+    needs: create-release
+    if: ${{ needs.create-release.result == 'success' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download consolidated scan reports
+        uses: actions/download-artifact@v4
+        with:
+          name: consolidated-security-reports
+          path: reports/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install report generator dependencies
+        shell: bash
+        run: |
+          pip install \
+            python-docx>=1.1.2 \
+            jinja2>=3.1.4 \
+            pyyaml>=6.0.2 \
+            --quiet
+
+      - name: Detect CIA profile
+        shell: bash
+        run: |
+          if [ -f "cia-profile.yaml" ]; then
+            echo "CIA_PROFILE_PATH=cia-profile.yaml" >> "${GITHUB_ENV}"
+            echo "[INFO] cia-profile.yaml found in repository root"
+          else
+            echo "CIA_PROFILE_PATH=scripts/cia-profile-default.yaml" >> "${GITHUB_ENV}"
+            echo "[WARN] cia-profile.yaml not found — using default profile"
+            # Copy bundled default if present
+            if [ -f "scripts/cia-profile-default.yaml" ]; then
+              echo "[INFO] Using scripts/cia-profile-default.yaml"
+            else
+              echo "[WARN] No profile found — generator will use hardcoded defaults"
+              echo "CIA_PROFILE_PATH=" >> "${GITHUB_ENV}"
+            fi
+          fi
+
+      - name: Generate security reports
+        shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_SHA:        ${{ github.sha }}
+          GITHUB_REF_NAME:   ${{ github.ref_name }}
+        run: |
+          python3 scripts/generate_reports.py \
+            --reports-dir reports/ \
+            --profile-path "${CIA_PROFILE_PATH:-}" \
+            --output-dir   security-reports/
+
+      - name: List generated reports
+        shell: bash
+        run: |
+          echo "Generated report files:"
+          ls -lh security-reports/ || echo "  (none found)"
+
+      - name: Read artifact retention setting
+        shell: bash
+        run: |
+          # Read retention_days from cia-profile.yaml, default 90, cap at 90
+          RETENTION=$(python3 -c "
+          import yaml, sys
+          try:
+              with open('${CIA_PROFILE_PATH:-cia-profile.yaml}') as f:
+                  d = yaml.safe_load(f) or {}
+              days = int(d.get('pipeline', {}).get('artifact_retention_days', 90))
+              print(min(max(days, 1), 90))
+          except Exception:
+              print(90)
+          " 2>/dev/null || echo "90")
+          echo "ARTIFACT_RETENTION=${RETENTION}" >> "${GITHUB_ENV}"
+          echo "[INFO] Artifact retention: ${RETENTION} days"
+
+      - name: Upload security reports artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_number }}
+          path: security-reports/
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+      - name: Attach reports to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          LATEST_TAG=$(gh release list \
+            --limit 10 \
+            --json tagName \
+            --jq '[.[] | select(.tagName | startswith("security-scan-"))] | .[0].tagName' \
+            2>/dev/null || echo "")
+
+          if [ -z "${LATEST_TAG}" ]; then
+            echo "[WARN] No security-scan release found — skipping attachment."
+            exit 0
+          fi
+
+          echo "[INFO] Attaching reports to release: ${LATEST_TAG}"
+
+          ATTACHED=0
+          for f in security-reports/*.docx security-reports/*.html security-reports/*.md; do
+            [ -f "${f}" ] || continue
+            FILENAME=$(basename "${f}")
+            if gh release upload "${LATEST_TAG}" "${f}" --clobber 2>/dev/null; then
+              echo "  [OK] ${FILENAME}"
+              ATTACHED=$((ATTACHED + 1))
+            else
+              echo "  [WARN] Could not upload ${FILENAME}"
+            fi
+          done
+
+          echo "[INFO] ${ATTACHED} report(s) attached to ${LATEST_TAG}"
