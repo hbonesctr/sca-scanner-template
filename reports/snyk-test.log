@@ -1,11 +1,9 @@
 
- ERROR   Unspecified Error (SNYK-CLI-0000)
-                                                                                        
-           Failed to get dependencies for all 1 potential projects.                     
-                                                                                        
-           /tmp/extracted/01-pylibssh-1.4.0/pylibssh-1.4.0/docs/requirements.txt:       
-           Missing required packages                                                    
+ FATAL   No supported files found (SNYK-CLI-0008)
+                                                                                                                                                      
+           Could not detect supported target files in /tmp/extracted.                                                                                 
+           Please see our documentation for supported languages and target files: [4mhttps://snyk.co/udVgQ[24m and make sure you are in the right directory. 
 
-Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-cli-0000 
+Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-cli-0008 
                                                                          
-ID:      urn:snyk:interaction:7472ec8c-64f0-4416-b192-2846c595a5b7 
+ID:      urn:snyk:interaction:dacdb7e6-e5c4-4f95-902a-6c079ff0b217 

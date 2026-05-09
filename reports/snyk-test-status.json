@@ -1,6 +1,6 @@
 {
   "scanner": "snyk",
   "command": "test",
-  "all_projects_exit_code": "2",
+  "all_projects_exit_code": "3",
   "unmanaged_exit_code": "147"
 }
