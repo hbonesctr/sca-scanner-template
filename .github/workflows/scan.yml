@@ -1,8 +1,8 @@
 ################################################################################
 # DoD Security Scanner - ZIP-based Customer Software Workflow
 # Author: Hector L. Bones
-# Version: 2.1
-# Last Updated: 2026-05-08
+# Version: 2.2
+# Last Updated: 2026-05-09
 #
 # Purpose:
 # - Accept customer-provided source packages under customer-software/
@@ -20,10 +20,16 @@
 #
 # Required repository secret:
 # - SNYK_TOKEN
-# - SNYK_ORG_ID
+# Optional repository secret:
+# - SNYK_ORG_ID  (if omitted, Snyk CLI defaults to the account's default org)
 # Recommended repository settings:
 # - Actions permissions: Read and write permissions
 # - Allow GitHub Actions to create and approve pull requests: not required
+#
+# Changelog:
+# v2.2 - Added actions/checkout@v4 to create-release job (fixes "not a git
+#        repository" error when gh CLI attempts to create the release).
+#        Corrected SNYK_ORG_ID header comment from "Required" to "Optional".
 ################################################################################
 
 name: DoD Security Scanner
@@ -888,6 +894,12 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == 'true' }}
 
     steps:
+      # FIX v2.2: gh CLI requires a git repository context to resolve the
+      # remote and authenticate the release. Without this checkout the runner
+      # workspace has no .git directory and gh exits with "not a git repository".
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download consolidated reports
         uses: actions/download-artifact@v4
         with:
@@ -902,7 +914,7 @@ jobs:
           # Release metadata. Use UTC for repeatable audit timestamps.
           SCAN_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           SHORT_COMMIT="${GITHUB_SHA::7}"
-          SCANNER_VERSION="v2.1 Browser-Based Snyk/Semgrep/Syft/Grype"
+          SCANNER_VERSION="v2.2 Browser-Based Snyk/Semgrep/Syft/Grype"
           ARCHIVE_NAME="security-scan-reports-${{ github.run_number }}.zip"
 
           # Package all consolidated report outputs into one downloadable archive.
