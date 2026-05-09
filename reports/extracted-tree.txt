@@ -274,3 +274,4 @@
 /tmp/extracted/01-pylibssh-devel/pylibssh-devel/tests/unit/version_test.py
 /tmp/extracted/01-pylibssh-devel/pylibssh-devel/tox.ini
 /tmp/extracted/repository-content/UPLOAD_HERE.md
+/tmp/extracted/repository-content/cia-profile.yaml
