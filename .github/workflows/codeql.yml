@@ -1,0 +1,291 @@
+################################################################################
+# DoD Security Scanner - CodeQL SAST Workflow
+# Author: Hector L. Bones
+# Version: 1.0
+# Last Updated: 2026-05-09
+#
+# Purpose:
+# - Run CodeQL semantic code analysis against extracted customer software
+# - Upload findings to GitHub Security tab (Code scanning alerts)
+# - Attach SARIF results to the GitHub Release created by scan.yml
+#
+# Design notes:
+# - Triggered by workflow_run on "DoD Security Scanner" success.
+#   This guarantees the release already exists before we try to attach to it,
+#   eliminating any race condition with scan.yml.
+# - Languages are auto-detected from file extensions inside the customer ZIP.
+#   CodeQL runs as a matrix — one job per detected language in parallel.
+# - build-mode: none is used for all languages. This is reliable across
+#   customer ZIPs where a full build environment is unavailable. For compiled
+#   languages (Java, C#, C/C++) this trades some precision for reliability.
+#   If a customer package is buildable, switch build-mode to autobuild for
+#   that language to improve results.
+# - SARIF files are uploaded to the GitHub Security tab automatically by the
+#   codeql-action/analyze step, and also attached as files to the latest
+#   GitHub Release for inclusion in the DoD audit archive.
+#
+# Supported languages (auto-detected):
+#   python, javascript/typescript, java/kotlin, c#, go, ruby, c/c++
+#
+# Required repository settings:
+# - Actions permissions: Read and write permissions
+# - Security events: write (handled by this workflow's permissions block)
+################################################################################
+
+name: CodeQL Security Analysis
+
+on:
+  workflow_run:
+    workflows: ["DoD Security Scanner"]
+    types: [completed]
+
+permissions:
+  contents: write
+  security-events: write
+  actions: read
+
+jobs:
+
+  ############################################################################
+  # Job 1 — Extract the customer ZIP and detect which languages are present.
+  # Outputs a JSON matrix consumed by the analyze job.
+  ############################################################################
+  detect-languages:
+    name: Detect Languages
+    runs-on: ubuntu-latest
+    # Only run when the scan workflow succeeded (release exists).
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_languages: ${{ steps.detect.outputs.has_languages }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Extract customer ZIP and detect languages
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p customer-source
+
+          # Extract all ZIP files found under customer-software/
+          ZIP_COUNT=0
+          while IFS= read -r -d '' zipfile; do
+            echo "Extracting: ${zipfile}"
+            unzip -q "${zipfile}" -d customer-source/ 2>/dev/null || true
+            ZIP_COUNT=$((ZIP_COUNT + 1))
+          done < <(find customer-software/ -name "*.zip" -print0 2>/dev/null)
+
+          # Fallback: if no ZIPs, copy any non-ZIP source files directly
+          if [ "${ZIP_COUNT}" -eq 0 ]; then
+            echo "No ZIP files found. Copying non-ZIP content from customer-software/."
+            find customer-software/ -type f ! -name "*.zip" | while read -r f; do
+              cp --parents "${f}" customer-source/ 2>/dev/null || true
+            done
+          fi
+
+          FILE_COUNT=$(find customer-source/ -type f | wc -l)
+          echo "Total files available for CodeQL: ${FILE_COUNT}"
+
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+
+          # Map file extensions to CodeQL language identifiers.
+          # java-kotlin covers both Java and Kotlin source.
+          # c-cpp covers C and C++ source.
+          EXT_MAP = {
+              '.py':   'python',
+              '.js':   'javascript',
+              '.ts':   'javascript',
+              '.jsx':  'javascript',
+              '.tsx':  'javascript',
+              '.mjs':  'javascript',
+              '.cjs':  'javascript',
+              '.java': 'java-kotlin',
+              '.kt':   'java-kotlin',
+              '.kts':  'java-kotlin',
+              '.cs':   'csharp',
+              '.go':   'go',
+              '.rb':   'ruby',
+              '.c':    'c-cpp',
+              '.cpp':  'c-cpp',
+              '.cc':   'c-cpp',
+              '.cxx':  'c-cpp',
+              '.h':    'c-cpp',
+              '.hpp':  'c-cpp',
+          }
+
+          detected = set()
+          source_dir = pathlib.Path('customer-source')
+
+          for f in source_dir.rglob('*'):
+              if f.is_file():
+                  lang = EXT_MAP.get(f.suffix.lower())
+                  if lang:
+                      detected.add(lang)
+
+          if not detected:
+              # Safe fallback — scan for python and javascript even if nothing
+              # was detected, so CodeQL always produces some output.
+              print("WARNING: No recognizable source extensions found. Defaulting to python + javascript.")
+              detected = {'python', 'javascript'}
+
+          # All languages use build-mode: none for maximum reliability.
+          # This works for all interpreted languages and, since CodeQL 2.15+,
+          # for compiled languages (Java, C#, C/C++) as well.
+          matrix_items = [
+              {'language': lang, 'build-mode': 'none'}
+              for lang in sorted(detected)
+          ]
+
+          matrix_json = json.dumps({'include': matrix_items})
+          has_languages = 'true'
+
+          github_output = os.environ['GITHUB_OUTPUT']
+          with open(github_output, 'a') as fh:
+              fh.write(f'matrix={matrix_json}\n')
+              fh.write(f'has_languages={has_languages}\n')
+
+          print(f'Detected languages: {sorted(detected)}')
+          print(f'Matrix output:      {matrix_json}')
+          PY
+
+      - name: Upload extracted source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: customer-source-for-codeql
+          path: customer-source/
+          # Short retention — only needed for the analyze jobs below.
+          retention-days: 1
+
+  ############################################################################
+  # Job 2 — Run CodeQL analysis for each detected language in parallel.
+  # Produces one SARIF file per language, uploaded to the Security tab and
+  # saved as an artifact for the release attachment job.
+  ############################################################################
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    needs: detect-languages
+    if: ${{ needs.detect-languages.outputs.has_languages == 'true' }}
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect-languages.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download extracted customer source
+        uses: actions/download-artifact@v4
+        with:
+          name: customer-source-for-codeql
+          path: customer-source/
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          source-root: customer-source
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          # Save SARIF to disk so the attach-to-release job can upload it.
+          output: sarif-results
+          # Upload to GitHub Security tab (Code scanning alerts).
+          upload: always
+
+      - name: Upload SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: sarif-results/
+          retention-days: 14
+
+  ############################################################################
+  # Job 3 — Collect all per-language SARIF files and attach them to the
+  # most recent GitHub Release (created by scan.yml in the prior run).
+  ############################################################################
+  attach-to-release:
+    name: Attach CodeQL Results to Release
+    runs-on: ubuntu-latest
+    needs: analyze
+    # Run even if some language jobs failed — attach whatever succeeded.
+    if: always() && needs.analyze.result != 'skipped'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codeql-sarif-*
+          path: all-sarif/
+          merge-multiple: true
+
+      - name: List collected SARIF files
+        shell: bash
+        run: |
+          echo "SARIF files collected:"
+          find all-sarif/ -name "*.sarif" | sort || echo "  (none found)"
+
+      - name: Attach SARIF files to latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Find the most recent security-scan release created by scan.yml.
+          LATEST_TAG=$(gh release list \
+            --limit 10 \
+            --json tagName \
+            --jq '[.[] | select(.tagName | startswith("security-scan-"))] | .[0].tagName' \
+            2>/dev/null || echo "")
+
+          if [ -z "${LATEST_TAG}" ]; then
+            echo "No security-scan release found. Skipping SARIF attachment."
+            exit 0
+          fi
+
+          echo "Target release: ${LATEST_TAG}"
+
+          ATTACHED=0
+          FAILED=0
+
+          while IFS= read -r -d '' sarif_file; do
+            FILENAME=$(basename "${sarif_file}")
+            echo "Uploading ${FILENAME} to ${LATEST_TAG}..."
+
+            if gh release upload "${LATEST_TAG}" "${sarif_file}" \
+                --clobber 2>/dev/null; then
+              echo "  OK: ${FILENAME}"
+              ATTACHED=$((ATTACHED + 1))
+            else
+              echo "  WARN: could not upload ${FILENAME}"
+              FAILED=$((FAILED + 1))
+            fi
+          done < <(find all-sarif/ -name "*.sarif" -print0)
+
+          echo ""
+          echo "Summary: ${ATTACHED} SARIF file(s) attached, ${FAILED} failed."
+
+          if [ "${ATTACHED}" -eq 0 ]; then
+            echo "WARNING: No SARIF files were attached to the release."
+          fi
