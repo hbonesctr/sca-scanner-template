@@ -1,0 +1,111 @@
+################################################################################
+# DoD Security Scanner - Reports Cleanup Workflow
+# Author: Hector L. Bones
+# Version: 1.0
+# Last Updated: 2026-05-09
+#
+# Purpose:
+# - Delete all files inside the reports/ directory in the repository
+# - Preserve the reports/ directory itself via .gitkeep
+# - Reset the cleanup trigger file after execution
+#
+# How to trigger (mobile Safari friendly — no workflow_dispatch UI needed):
+# 1. Go to your repo → Code tab
+# 2. Navigate to cleanup-triggers/cleanup.trigger
+# 3. Tap the pencil icon (edit)
+# 4. Change the date on the "Last triggered" line to today's date
+# 5. Tap Commit changes
+# This workflow fires automatically and clears reports/
+################################################################################
+
+name: Cleanup Reports
+
+on:
+  push:
+    paths:
+      - "cleanup-triggers/cleanup.trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup-reports:
+    name: Clear Reports Directory
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Delete all files in reports/
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "reports" ]; then
+            echo "reports/ directory does not exist. Nothing to clean."
+            exit 0
+          fi
+
+          FILE_COUNT=$(find reports/ -type f ! -name ".gitkeep" | wc -l)
+          echo "Files found in reports/: ${FILE_COUNT}"
+
+          if [ "${FILE_COUNT}" -eq 0 ]; then
+            echo "reports/ is already empty. Nothing to clean."
+            exit 0
+          fi
+
+          find reports/ -type f ! -name ".gitkeep" -delete
+          echo "Deleted ${FILE_COUNT} file(s) from reports/."
+
+          # Write a fresh .gitkeep so the directory stays tracked in git.
+          # Git does not track empty directories.
+          cat > reports/.gitkeep <<EOF
+          # This file preserves the reports/ directory in git.
+          # Maintained automatically by the cleanup workflow.
+          # Last cleaned: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Workflow run: ${GITHUB_RUN_NUMBER}
+          EOF
+
+      - name: Reset cleanup trigger file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p cleanup-triggers
+
+          cat > cleanup-triggers/cleanup.trigger <<EOF
+          # DoD Security Scanner - Cleanup Trigger File
+          #
+          # To trigger a reports/ cleanup, edit this file and commit.
+          # Change the date on the "Last triggered" line below.
+          # The cleanup workflow fires automatically on commit.
+          #
+          # Instructions (mobile Safari):
+          # 1. Tap the pencil icon on this file in GitHub
+          # 2. Change the date below to today's date
+          # 3. Tap Commit changes
+          #
+          # Last triggered: $(date -u +"%Y-%m-%d")
+          EOF
+
+      - name: Commit cleanup result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add reports/ cleanup-triggers/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Cleanup: cleared reports/ [run ${GITHUB_RUN_NUMBER}]"
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin "HEAD:${{ github.ref_name }}"
