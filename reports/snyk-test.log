@@ -1,11 +1,6 @@
 
- ERROR   Unspecified Error (SNYK-CLI-0000)
-                                                                                        
-           Failed to get dependencies for all 1 potential projects.                     
-                                                                                        
-           /tmp/extracted/01-pylibssh-1.4.0/pylibssh-1.4.0/docs/requirements.txt:       
-           Missing required packages                                                    
-
-Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-cli-0000 
-                                                                         
-ID:      urn:snyk:interaction:2e5a32cf-51ba-4845-8c3d-06f08fd35a00 
+ ERROR   Unavailable due to maintenance (SNYK-0099)
+Status:  503 Service Unavailable 
+Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-0099 
+                                                                     
+ID:      urn:snyk:interaction:8ed23ca9-0075-4f92-959d-922373890271 

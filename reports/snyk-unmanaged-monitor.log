@@ -1,7 +1,6 @@
-[1m[37m[39m[22m
-[1m[37mMonitoring /tmp/extracted (extracted)...[39m[22m
-[1m[37m[39m[22m
-[1m[37m[39m[22mExplore this snapshot at https://app.snyk.io/org/hbonesctr/project/640203be-0412-47c0-9e3d-388e08edba11/history/6f0c34a2-c241-4f06-88eb-073232bdbeee
 
-Notifications about newly disclosed issues related to these dependencies will be emailed to you.
-
+ ERROR   Unavailable due to maintenance (SNYK-0099)
+Status:  503 Service Unavailable 
+Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-0099 
+                                                                     
+ID:      urn:snyk:interaction:773c64e3-e4fb-4aaf-872a-51176e39f90a 
