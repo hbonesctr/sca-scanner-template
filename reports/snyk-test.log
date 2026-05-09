@@ -1,9 +1,0 @@
-
- FATAL   No supported files found (SNYK-CLI-0008)
-                                                                                                                                                      
-           Could not detect supported target files in /tmp/extracted.                                                                                 
-           Please see our documentation for supported languages and target files: [4mhttps://snyk.co/udVgQ[24m and make sure you are in the right directory. 
-
-Docs:    https://docs.snyk.io/scan-with-snyk/error-catalog#snyk-cli-0008 
-                                                                         
-ID:      urn:snyk:interaction:05864aae-9eb9-4643-b96c-bae88f7f4fc7 

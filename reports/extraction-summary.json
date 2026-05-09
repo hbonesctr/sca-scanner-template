@@ -1,8 +1,0 @@
-{
-  "source_directory": "/home/runner/work/sca-scanner-template/sca-scanner-template/customer-software",
-  "extraction_directory": "/tmp/extracted",
-  "zip_files_found": [],
-  "zip_files_extracted": [],
-  "non_zip_content_copied": true,
-  "errors": []
-}

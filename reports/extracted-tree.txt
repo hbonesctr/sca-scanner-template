@@ -1,2 +1,0 @@
----- Extracted tree ----
-/tmp/extracted/repository-content/UPLOAD_HERE.md
