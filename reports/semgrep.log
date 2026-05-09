@@ -3,14 +3,8 @@
 ┌─────────────┐
 │ Scan Status │
 └─────────────┘
-  Scanning 78 files tracked by git with 147 Code rules:
-                                                                                                                        
-  Language      Rules   Files          Origin      Rules                                                                
- ─────────────────────────────        ───────────────────                                                               
-  <multilang>       2      78          Community     147                                                                
-  python           19      19                                                                                           
-  dockerfile        2       1                                                                                           
-                                                                                                                        
+  Scanning 1 file tracked by git with 147 Code rules:
+  Scanning 1 file with 2 <multilang> rules.
                 
                 
 ┌──────────────┐
@@ -18,13 +12,11 @@
 └──────────────┘
 ✅ Scan completed successfully.
  • Findings: 0 (0 blocking)
- • Rules run: 23
- • Targets scanned: 78
+ • Rules run: 2
+ • Targets scanned: 1
  • Parsed lines: ~100.0%
- • Scan skipped: 
-   ◦ Files matching .semgrepignore patterns: 4
- • For a detailed list of skipped files and lines, run semgrep with the --verbose flag
-Ran 23 rules on 78 files: 0 findings.
+ • No ignore information available
+Ran 2 rules on 1 file: 0 findings.
 (need more rules? `semgrep login` for additional free Semgrep Registry rules)
 
 If Semgrep missed a finding, please send us feedback to let us know!
