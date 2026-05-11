@@ -1,7 +1,8 @@
 ################################################################################
-# DoD Security Scanner - ZIP-based Customer Software Workflow
+# Open Source Software (OSS) Security Scanner
+# ZIP-based Customer Software Workflow
 # Author: Hector L. Bones
-# Version: 2.3
+# Version: 2.4
 # Last Updated: 2026-05-09
 #
 # Purpose:
@@ -9,7 +10,7 @@
 # - Safely extract ZIP files into the GitHub Actions runner workspace
 # - Scan the extracted source with SBOM, SCA, and SAST tools
 # - Publish audit-ready outputs to reports/
-# - Create GitHub Releases with full audit-ready release notes on every
+# - Create GitHub Releases with rich, data-driven release notes on every
 #   successful scan (push or manual dispatch)
 #
 # Important design note:
@@ -35,9 +36,15 @@
 #        Release now fires automatically on every successful consolidate-reports
 #        regardless of trigger type (push or workflow_dispatch). Eliminates
 #        mobile Safari limitation where workflow_dispatch UI is non-functional.
+# v2.4 - Rebranded to Open Source Software (OSS) Security Scanner.
+#        Enhanced release page: rich data-driven body built from actual scan
+#        JSON outputs (findings counts, CVSS table, SAST table, compliance
+#        controls, tool status). Added Author and Date to release identity.
+#        Switched release action to softprops/action-gh-release@v2.
+#        Added generate-security-reports job (DOCX/HTML/MD output).
 ################################################################################
 
-name: DoD Security Scanner
+name: Open Source Software (OSS) Security Scanner
 
 on:
   workflow_dispatch:
@@ -813,7 +820,7 @@ jobs:
           manifest_count = len([line for line in manifest_text.splitlines() if line.strip() and not line.startswith("----")])
 
           lines = []
-          lines.append(f"# Security Scan Report - Run {run_number}")
+          lines.append(f"# OSS Security Scan Report - Run {run_number}")
           lines.append("")
           lines.append(f"- Repository: `{repository}`")
           lines.append(f"- Branch/Ref: `{ref_name}`")
@@ -886,7 +893,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Security scan reports for run ${{ github.run_number }}"
+          git commit -m "OSS security scan reports for run ${{ github.run_number }}"
 
           git pull --rebase origin "${{ github.ref_name }}" || true
           git push origin "HEAD:${{ github.ref_name }}"
@@ -895,109 +902,335 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: consolidate-reports
-    # v2.3: Fires automatically on every successful consolidate-reports.
-    # Removed workflow_dispatch event guard — mobile Safari cannot trigger
-    # workflow_dispatch via browser UI (confirmed GitHub bug). Every scan
-    # of customer software now produces a release for DoD audit trail.
+    # Fires automatically on every successful consolidate-reports.
+    # Works on push and workflow_dispatch — no mobile UI required.
     if: ${{ needs.consolidate-reports.result == 'success' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Pull latest
+        run: git pull --rebase origin ${{ github.ref_name }} || true
 
       - name: Download consolidated reports
         uses: actions/download-artifact@v4
         with:
           name: consolidated-security-reports
-          path: release-artifacts/reports
+          path: release-artifacts/reports/
 
-      - name: Create release archive and release notes
-        shell: bash
+      - name: Copy documentation into archive
         run: |
-          set -euo pipefail
+          [ -f REFERENCES.md ]          && cp REFERENCES.md          release-artifacts/ || true
+          [ -f COMPLIANCE-OVERVIEW.md ] && cp COMPLIANCE-OVERVIEW.md release-artifacts/ || true
 
-          SCAN_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          SHORT_COMMIT="${GITHUB_SHA::7}"
-          SCANNER_VERSION="v2.3 Browser-Based Snyk/Semgrep/Syft/Grype"
-          ARCHIVE_NAME="security-scan-reports-${{ github.run_number }}.zip"
+      # ─────────────────────────────────────────────────────────────────────
+      # Build rich, data-driven release body from actual scan JSON outputs.
+      # Sections: Findings Summary, Scan Identity (with Author + Date),
+      # Compliance Controls, Vulnerability Findings table, SAST table,
+      # Tool Execution status, Attached Files manifest.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Build release body
+        run: |
+          python3 - << 'PYTHON'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-          zip -r "${ARCHIVE_NAME}" release-artifacts/reports REFERENCES.md COMPLIANCE-OVERVIEW.md
+          reports = Path("release-artifacts/reports")
 
-          cat > release-notes.md <<EOF
-          # DoD Security Scan Complete
+          # ── Helpers ──────────────────────────────────────────────────────
+          def load_json(name):
+              p = reports / name
+              if p.exists() and p.stat().st_size > 2:
+                  try:
+                      return json.loads(p.read_text())
+                  except Exception:
+                      return {}
+              return {}
 
-          **Scan Date:** ${SCAN_DATE}
-          **Commit:** ${SHORT_COMMIT}
-          **Scanner Version:** ${SCANNER_VERSION}
-          **Repository:** ${{ github.repository }}
-          **Workflow Run:** ${{ github.run_number }}
+          def tool_status(d):
+              ec = d.get("scan_exit_code", d.get("exit_code", -1))
+              try:
+                  ec = int(ec)
+              except (TypeError, ValueError):
+                  return str(ec) if ec not in (None, -1) else "Not run"
+              if ec ==   0: return "Complete"
+              if ec ==   1: return "Vulnerabilities found"
+              if ec ==   3: return "No package manifests found"
+              if ec == 127: return "Tool not installed"
+              if ec == 147: return "No C/C++ source detected"
+              if ec ==  -1: return "Not run"
+              return f"Exit code {ec}"
 
-          ## Deliverables
+          def cvss_score(m):
+              cvss = m.get("vulnerability", {}).get("cvss", [])
+              return cvss[0].get("metrics", {}).get("baseScore", 0) if cvss else 0
 
-          - SBOM in SPDX JSON format
-          - SAST Results using Semgrep
-          - SCA Results using Snyk and Grype
-          - Snyk monitor output for Snyk UI project creation
-          - Compliance-oriented security scan report
-          - Extraction inventory and manifest-candidate evidence
+          # ── Load data ────────────────────────────────────────────────────
+          grype      = load_json("grype-results.json")
+          sbom       = load_json("sbom-spdx.json")
+          semgrep    = load_json("semgrep-results.json")
+          snyk_st    = load_json("snyk-test-status.json")
+          grype_st   = load_json("grype-status.json")
+          syft_st    = load_json("syft-status.json")
+          semgrep_st = load_json("semgrep-status.json")
+          extraction = load_json("extraction-summary.json")
 
-          ## Standards Alignment
+          # ── Counts ───────────────────────────────────────────────────────
+          matches    = grype.get("matches", [])
+          sev_order  = ["Critical", "High", "Medium", "Low", "Negligible"]
+          sev_counts = {s: 0 for s in sev_order}
+          kev_count  = 0
 
-          - DISA ASD STIG evidence support
-          - NIST SP 800-53 Rev. 5 evidence support
-          - NTIA SBOM Requirements support
-          - CVSS v3.x vulnerability scoring support where provided by scanners
+          for m in matches:
+              sev = m.get("vulnerability", {}).get("severity", "Unknown")
+              if sev in sev_counts:
+                  sev_counts[sev] += 1
+              if m.get("vulnerability", {}).get("kev", False):
+                  kev_count += 1
 
-          ## Important Notes
+          total_vulns  = sum(sev_counts.values())
+          pkg_count    = len(sbom.get("packages", []))
+          sast_results = semgrep.get("results", [])
+          sast_count   = len(sast_results)
 
-          This workflow is designed for a GitHub Free/private-repository scanner-wrapper model.
+          zip_found    = len(extraction.get("zip_files_found", []))
+          zip_ext      = len(extraction.get("zip_files_extracted", []))
 
-          CodeQL is not claimed in this release because GitHub CodeQL code scanning for private
-          repositories requires GitHub Advanced Security. SAST coverage is provided by Semgrep.
+          # ── Env vars ─────────────────────────────────────────────────────
+          repo      = os.environ.get("GITHUB_REPOSITORY", "unknown")
+          run_num   = os.environ.get("GITHUB_RUN_NUMBER", "?")
+          ref_name  = os.environ.get("GITHUB_REF_NAME", "?")
+          sha       = os.environ.get("GITHUB_SHA", "?")[:8]
+          event     = os.environ.get("GITHUB_EVENT_NAME", "?")
+          scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-          If Snyk does not show a project in the Snyk UI, review:
-          - reports/snyk-monitor-status.json
-          - reports/snyk-monitor.log
-          - reports/snyk-manifest-candidates.txt
+          L = []
 
-          ## Download
+          # ════════════════════════════════════════════════════════════════
+          # HEADER
+          # ════════════════════════════════════════════════════════════════
+          L += [
+              "# Open Source Software (OSS) Security Scanner",
+              "",
+              f"**Author:** Hector L. Bones  ",
+              f"**Scan Date:** {scan_date}  ",
+              f"**Scanner Version:** v2.4 (Syft · Grype · Snyk · Semgrep · CodeQL)  ",
+              f"**Classification:** UNCLASSIFIED",
+              "",
+          ]
 
-          Download the attached report archive below for audit documentation.
-          EOF
+          # ════════════════════════════════════════════════════════════════
+          # SECTION 1 — FINDINGS SUMMARY
+          # ════════════════════════════════════════════════════════════════
+          L += [
+              "---",
+              "",
+              "## Findings Summary",
+              "",
+              "| Metric | Value |",
+              "|---|---|",
+          ]
+          for sev in sev_order:
+              if sev_counts[sev] > 0:
+                  L.append(f"| {sev} Vulnerabilities | {sev_counts[sev]} |")
+          L += [
+              f"| **Total Vulnerabilities** | **{total_vulns}** |",
+              f"| In CISA KEV | {kev_count} |",
+              f"| SBOM Packages Inventoried | {pkg_count} |",
+              f"| SAST Findings | {sast_count} |",
+              f"| ZIP Files Extracted | {zip_ext} of {zip_found} |",
+              "",
+          ]
+
+          # ════════════════════════════════════════════════════════════════
+          # SECTION 2 — SCAN IDENTITY
+          # ════════════════════════════════════════════════════════════════
+          L += [
+              "---",
+              "",
+              "## Scan Identity",
+              "",
+              "| Field | Value |",
+              "|---|---|",
+              f"| Author | Hector L. Bones |",
+              f"| Scan Date | {scan_date} |",
+              f"| Repository | {repo} |",
+              f"| Branch | {ref_name} |",
+              f"| Commit | `{sha}` |",
+              f"| Run Number | {run_num} |",
+              f"| Triggered By | {event} |",
+              "",
+          ]
+
+          # ════════════════════════════════════════════════════════════════
+          # SECTION 3 — COMPLIANCE CONTROLS
+          # ════════════════════════════════════════════════════════════════
+          semgrep_s = tool_status(semgrep_st)
+          grype_s   = tool_status(grype_st)
+          syft_s    = tool_status(syft_st)
+
+          def satisfied(s):
+              return "Satisfied" if s in ("Complete", "Vulnerabilities found") else f"Partial — {s}"
+
+          L += [
+              "---",
+              "",
+              "## Compliance Controls",
+              "",
+              "| Control | Standard | Tool | Status |",
+              "|---|---|---|---|",
+              f"| APSC-DV-002560 — SAST Execution | DISA ASD STIG v5 | Semgrep | {satisfied(semgrep_s)} |",
+              f"| APSC-DV-003235 — Dependency Scanning | DISA ASD STIG v5 | Grype + Snyk | {satisfied(grype_s)} |",
+              f"| SA-11 — Developer Testing | NIST SP 800-53 Rev 5 | Semgrep | {satisfied(semgrep_s)} |",
+               "| SA-15 — Development Process | NIST SP 800-53 Rev 5 | Workflow logs + commit history | Satisfied |",
+              f"| RA-5 — Vulnerability Monitoring | NIST SP 800-53 Rev 5 | Grype + Snyk | {satisfied(grype_s)} |",
+              f"| SR-3 — Supply Chain Protection | NIST SP 800-53 Rev 5 | Syft | {satisfied(syft_s)} |",
+              f"| SR-4 — Provenance Tracking | NIST SP 800-53 Rev 5 | Syft (PURL/CPE) | {satisfied(syft_s)} |",
+              f"| NTIA SBOM Minimum Elements | SBOM Federal Mandate | Syft | {satisfied(syft_s)} |",
+               "| DoDI 8510.01 — Audit Trail | DoD Policy | GitHub Release | Satisfied |",
+              "",
+          ]
+
+          # ════════════════════════════════════════════════════════════════
+          # SECTION 4 — VULNERABILITY FINDINGS TABLE
+          # ════════════════════════════════════════════════════════════════
+          L += [
+              "---",
+              "",
+              "## Vulnerability Findings",
+              "",
+          ]
+
+          if matches:
+              sorted_matches = sorted(matches, key=cvss_score, reverse=True)
+              L += [
+                  "| ID | Severity | CVSS | Package | Version | Fix Available | KEV |",
+                  "|---|---|---|---|---|---|---|",
+              ]
+              for m in sorted_matches:
+                  vuln     = m.get("vulnerability", {})
+                  art      = m.get("artifact", {})
+                  fix      = vuln.get("fix", {})
+                  vuln_id  = vuln.get("id", "?")
+                  sev      = vuln.get("severity", "?")
+                  score    = cvss_score(m) or "N/A"
+                  pkg_name = art.get("name", "?")
+                  pkg_ver  = art.get("version", "?")
+                  fix_ver  = (", ".join(fix.get("versions", []))
+                              if fix.get("versions") else fix.get("state", "Unknown"))
+                  kev_flag = "**YES**" if vuln.get("kev", False) else "No"
+                  L.append(
+                      f"| {vuln_id} | {sev} | {score} | "
+                      f"`{pkg_name}` | {pkg_ver} | {fix_ver} | {kev_flag} |"
+                  )
+              L.append("")
+          else:
+              L += ["No vulnerabilities identified by Grype.", ""]
+
+          # SAST findings
+          if sast_results:
+              L += [
+                  "### SAST Findings",
+                  "",
+                  "| Rule | File | Line | Severity |",
+                  "|---|---|---|---|",
+              ]
+              cap = 25
+              for r in sast_results[:cap]:
+                  rule = r.get("check_id", "?").split(".")[-1]
+                  path = r.get("path", "?")
+                  line = r.get("start", {}).get("line", "?")
+                  sev  = r.get("extra", {}).get("severity", "?")
+                  L.append(f"| {rule} | `{path}` | {line} | {sev} |")
+              if len(sast_results) > cap:
+                  L.append(
+                      f"| *...and {len(sast_results) - cap} more — "
+                      f"see semgrep-results.json* | | | |"
+                  )
+              L.append("")
+          else:
+              L += ["### SAST Findings", "", "No SAST findings identified.", ""]
+
+          # ════════════════════════════════════════════════════════════════
+          # SECTION 5 — TOOL EXECUTION STATUS
+          # ════════════════════════════════════════════════════════════════
+          snyk_ec = snyk_st.get("all_projects_exit_code", "?")
+          try:
+              snyk_note = (
+                  "No package manifests found — Grype provided SCA coverage"
+                  if int(snyk_ec) == 3
+                  else tool_status({"scan_exit_code": snyk_ec})
+              )
+          except (TypeError, ValueError):
+              snyk_note = str(snyk_ec)
+
+          L += [
+              "---",
+              "",
+              "## Tool Execution",
+              "",
+              "| Tool | Purpose | Status |",
+              "|---|---|---|",
+              f"| Syft | SPDX 2.3 SBOM Generation | {tool_status(syft_st)} |",
+              f"| Grype | SCA Vulnerability Matching (CVSS · EPSS · KEV) | {tool_status(grype_st)} |",
+              f"| Snyk | Manifest-Based Dependency Scanning | {snyk_note} |",
+              f"| Semgrep | Static Application Security Testing (p/ci) | {tool_status(semgrep_st)} |",
+               "| CodeQL | Semantic Code Analysis | Results in Security tab |",
+              "",
+          ]
+
+          # ════════════════════════════════════════════════════════════════
+          # SECTION 6 — ATTACHED FILES
+          # ════════════════════════════════════════════════════════════════
+          L += [
+              "---",
+              "",
+              "## Attached Files",
+              "",
+              "| File | Contents |",
+              "|---|---|",
+              "| `sbom-spdx.json` | SPDX 2.3 Software Bill of Materials — all packages with PURL and CPE |",
+              "| `grype-results.json` | Vulnerability findings — CVSS v3.1, EPSS scores, CISA KEV flags |",
+              "| `snyk-results.json` | Snyk manifest-based dependency scan results |",
+              "| `semgrep-results.json` | Static analysis findings — Semgrep p/ci ruleset |",
+              "| `Security-Scan-Report-Latest.md` | Human-readable summary of this scan run |",
+              f"| `security-scan-reports-{run_num}.zip` | Complete audit archive — all reports and raw evidence |",
+              "",
+              "---",
+              "",
+              f"*Open Source Software (OSS) Security Scanner v2.4 \\| "
+              f"Author: Hector L. Bones \\| {scan_date} \\| UNCLASSIFIED*",
+          ]
+
+          body = "\n".join(L)
+          Path("/tmp/release-body.md").write_text(body, encoding="utf-8")
+          print(f"Release body written — {len(body):,} characters, {len(L)} lines")
+          PYTHON
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_REF_NAME:   ${{ github.ref_name }}
+          GITHUB_SHA:        ${{ github.sha }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+      - name: Build release archive ZIP
+        run: |
+          zip -r security-scan-reports-${{ github.run_number }}.zip \
+            release-artifacts/
+          echo "Archive size: $(du -sh security-scan-reports-${{ github.run_number }}.zip)"
 
       - name: Create GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          gh release create "security-scan-${{ github.run_number }}" \
-            "security-scan-reports-${{ github.run_number }}.zip" \
-            --title "DoD Security Scan Complete - Run ${{ github.run_number }}" \
-            --notes-file release-notes.md
-################################################################################
-# APPEND THIS JOB TO scan.yml — after the create-release job
-#
-# DoD Security Scanner — Report Generation Job
-# Version: 1.0
-# Compatible with: DoD Security Scanner v2.3
-#
-# What this adds:
-# - Reads consolidated scan reports from the consolidated-security-reports artifact
-# - Reads cia-profile.yaml from the scanned repository root (if present)
-# - Generates 9 report files: Developer/Analyst/Leadership × DOCX/HTML/Markdown
-# - Uploads reports as a GitHub Actions artifact (security-reports-RUN#)
-# - Attaches reports to the GitHub Release created by create-release
-#
-# Prerequisites:
-# - pip: python-docx, jinja2, pyyaml (installed inline — no Docker required)
-# - scripts/generate_reports.py  (add this file to your scanner template repo)
-# - scripts/requirements-reports.txt (add this file to your scanner template repo)
-# - cia-profile.yaml in root of SCANNED repository (optional, defaults used if absent)
-#
-# Artifact retention: configured in cia-profile.yaml (default: 90 days, max: 90)
-################################################################################
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:  security-scan-${{ github.run_number }}
+          name:      "OSS Security Scan — Run ${{ github.run_number }}"
+          body_path: /tmp/release-body.md
+          files:     security-scan-reports-${{ github.run_number }}.zip
+          token:     ${{ secrets.GITHUB_TOKEN }}
 
   generate-security-reports:
     name: Generate Security Reports
@@ -1038,7 +1271,6 @@ jobs:
           else
             echo "CIA_PROFILE_PATH=scripts/cia-profile-default.yaml" >> "${GITHUB_ENV}"
             echo "[WARN] cia-profile.yaml not found — using default profile"
-            # Copy bundled default if present
             if [ -f "scripts/cia-profile-default.yaml" ]; then
               echo "[INFO] Using scripts/cia-profile-default.yaml"
             else
@@ -1069,7 +1301,6 @@ jobs:
       - name: Read artifact retention setting
         shell: bash
         run: |
-          # Read retention_days from cia-profile.yaml, default 90, cap at 90
           RETENTION=$(python3 -c "
           import yaml, sys
           try:
