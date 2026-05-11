@@ -1,0 +1,6 @@
+{
+  "scanner": "snyk",
+  "command": "test",
+  "status": "NOT_EXECUTED",
+  "reason": "Missing SNYK_TOKEN"
+}

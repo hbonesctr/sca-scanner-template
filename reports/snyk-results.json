@@ -1,0 +1,6 @@
+{
+  "scanner": "snyk",
+  "command": "test",
+  "status": "NOT_EXECUTED",
+  "reason": "GitHub secret SNYK_TOKEN is not configured."
+}
