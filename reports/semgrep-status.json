@@ -1,0 +1,6 @@
+{
+  "scanner": "semgrep",
+  "command": "semgrep scan --config=p/ci",
+  "install_exit_code": 0,
+  "scan_exit_code": 0
+}

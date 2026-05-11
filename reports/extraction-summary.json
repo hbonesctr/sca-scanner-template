@@ -1,0 +1,15 @@
+{
+  "source_directory": "/home/runner/work/sca-scanner-template/sca-scanner-template/customer-software",
+  "extraction_directory": "/tmp/extracted",
+  "zip_files_found": [
+    "pylibssh-devel.zip"
+  ],
+  "zip_files_extracted": [
+    {
+      "zip": "pylibssh-devel.zip",
+      "target": "/tmp/extracted/01-pylibssh-devel"
+    }
+  ],
+  "non_zip_content_copied": true,
+  "errors": []
+}
