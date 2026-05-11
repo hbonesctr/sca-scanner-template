@@ -1,6 +1,0 @@
----- Manifest candidates ----
-/tmp/extracted/01-pylibssh-devel/pylibssh-devel/build-scripts/manylinux-container-image/Dockerfile
-/tmp/extracted/01-pylibssh-devel/pylibssh-devel/docs/requirements.txt
-/tmp/extracted/01-pylibssh-devel/pylibssh-devel/pyproject.toml
-/tmp/extracted/01-pylibssh-devel/pylibssh-devel/requirements-build.txt
-/tmp/extracted/01-pylibssh-devel/pylibssh-devel/setup.cfg

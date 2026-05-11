@@ -1,6 +1,0 @@
-{
-  "scanner": "snyk",
-  "command": "test --unmanaged",
-  "status": "NO_VALID_OUTPUT",
-  "exit_code": 147
-}

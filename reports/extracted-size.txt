@@ -1,2 +1,0 @@
----- Directory size ----
-1.6M	/tmp/extracted
