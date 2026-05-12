@@ -1,4 +1,4 @@
-# DoD Security Scanner - Cleanup Trigger File
+# Open Source Software (OSS) Security Scanner - Cleanup Trigger File
 #
 # To trigger a reports/ cleanup, edit this file and commit.
 # Change the date on the "Last triggered" line below.
