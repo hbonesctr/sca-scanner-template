@@ -1,6 +1,6 @@
 # Security Scanner — Metrics & Standards References
 
-**Project:** DoD Security Scanner  
+**Project:** Open Source Software (OSS) Security Scanner  
 **Author:** Hector L. Bones  
 **Last Reviewed:** 2026-05-09  
 **Version:** 1.0
