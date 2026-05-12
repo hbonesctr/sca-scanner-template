@@ -1,8 +1,8 @@
 ################################################################################
-# DoD Security Scanner - Reports Cleanup Workflow
+# Open Source Software (OSS) Security Scanner - Reports Cleanup Workflow
 # Author: Hector L. Bones
 # Version: 1.0
-# Last Updated: 2026-05-09
+# Last Updated: 2026-05-11
 #
 # Purpose:
 # - Delete all files inside the reports/ directory in the repository
@@ -77,7 +77,7 @@ jobs:
           mkdir -p cleanup-triggers
 
           cat > cleanup-triggers/cleanup.trigger <<EOF
-          # DoD Security Scanner - Cleanup Trigger File
+          # Open Source Software (OSS) Security Scanner - Cleanup Trigger File
           #
           # To trigger a reports/ cleanup, edit this file and commit.
           # Change the date on the "Last triggered" line below.
