@@ -275,7 +275,7 @@ jobs:
           du -sh "${EXTRACTED_DIR}" | tee -a out/extracted-size.txt || true
 
       - name: Upload extracted customer code artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: extracted-code
           path: /tmp/extracted
@@ -283,7 +283,7 @@ jobs:
 
       - name: Upload extraction debug artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: extraction-debug
           path: out/
@@ -343,7 +343,7 @@ jobs:
 
       - name: Upload SBOM artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-results
           path: out/
@@ -563,7 +563,7 @@ jobs:
 
       - name: Upload Snyk artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: snyk-results
           path: out/
@@ -623,7 +623,7 @@ jobs:
 
       - name: Upload Grype artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: grype-results
           path: out/
@@ -683,7 +683,7 @@ jobs:
 
       - name: Upload Semgrep artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: semgrep-results
           path: out/
@@ -871,7 +871,7 @@ jobs:
 
       - name: Upload consolidated reports artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: consolidated-security-reports
           path: reports/
@@ -1315,7 +1315,7 @@ jobs:
           echo "[INFO] Artifact retention: ${RETENTION} days"
 
       - name: Upload security reports artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-reports-${{ github.run_number }}
           path: security-reports/
