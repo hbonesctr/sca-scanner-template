@@ -2,8 +2,8 @@
 # Open Source Software (OSS) Security Scanner
 # ZIP-based Customer Software Workflow
 # Author: Hector L. Bones
-# Version: 2.4
-# Last Updated: 2026-05-09
+# Version: 2.5
+# Last Updated: 2026-05-11
 #
 # Purpose:
 # - Accept customer-provided source packages under customer-software/
@@ -36,6 +36,9 @@
 #        Release now fires automatically on every successful consolidate-reports
 #        regardless of trigger type (push or workflow_dispatch). Eliminates
 #        mobile Safari limitation where workflow_dispatch UI is non-functional.
+# v2.5 - Added emoji severity indicators (🔴 Critical 🟠 High 🟡 Moderate 🟢 Low ⚪ Negligible)
+#        Added KEV risk banner, tool status emoji (✅⚠️❌), compliance emoji.
+#        Relabels Grype "Medium" → "Moderate" per DISA/CVSS terminology.
 # v2.4 - Rebranded to Open Source Software (OSS) Security Scanner.
 #        Enhanced release page: rich data-driven body built from actual scan
 #        JSON outputs (findings counts, CVSS table, SAST table, compliance
@@ -941,7 +944,45 @@ jobs:
 
           reports = Path("release-artifacts/reports")
 
-          # ── Helpers ──────────────────────────────────────────────────────
+          # ── Severity display helpers ──────────────────────────────────────
+          # Grype uses "Medium". DISA/CVSS uses "Moderate".
+          # All display goes through sev_label() and sev_display().
+          #   🔴 Critical  🟠 High  🟡 Moderate  🟢 Low  ⚪ Negligible
+
+          SEV_EMOJI = {
+              "Critical":   "🔴",
+              "High":       "🟠",
+              "Medium":     "🟡",
+              "Moderate":   "🟡",
+              "Low":        "🟢",
+              "Negligible": "⚪",
+              "Unknown":    "⬛",
+          }
+
+          SEV_LABEL = {
+              "Critical":   "Critical",
+              "High":       "High",
+              "Medium":     "Moderate",   # relabeled to match DISA/CVSS
+              "Moderate":   "Moderate",
+              "Low":        "Low",
+              "Negligible": "Negligible",
+              "Unknown":    "Unknown",
+          }
+
+          # Display order for summary table (Grype keys, shown as DISA labels)
+          SEV_ORDER = ["Critical", "High", "Medium", "Low", "Negligible"]
+
+          def sev_label(raw):
+              """Return DISA display label for a Grype severity string."""
+              return SEV_LABEL.get(raw, raw)
+
+          def sev_display(raw):
+              """Return 'emoji Label' for a Grype severity string."""
+              emoji = SEV_EMOJI.get(raw, "⬛")
+              label = sev_label(raw)
+              return f"{emoji} {label}"
+
+          # ── General helpers ───────────────────────────────────────────────
           def load_json(name):
               p = reports / name
               if p.exists() and p.stat().st_size > 2:
@@ -956,20 +997,25 @@ jobs:
               try:
                   ec = int(ec)
               except (TypeError, ValueError):
-                  return str(ec) if ec not in (None, -1) else "Not run"
-              if ec ==   0: return "Complete"
-              if ec ==   1: return "Vulnerabilities found"
-              if ec ==   3: return "No package manifests found"
-              if ec == 127: return "Tool not installed"
-              if ec == 147: return "No C/C++ source detected"
-              if ec ==  -1: return "Not run"
-              return f"Exit code {ec}"
+                  return str(ec) if ec not in (None, -1) else "⚠️ Not run"
+              if ec ==   0: return "✅ Complete"
+              if ec ==   1: return "✅ Complete — vulnerabilities found"
+              if ec ==   3: return "⚠️ No package manifests found"
+              if ec == 127: return "❌ Tool not installed"
+              if ec == 147: return "⚠️ No C/C++ source detected"
+              if ec ==  -1: return "⚠️ Not run"
+              return f"⚠️ Exit code {ec}"
 
           def cvss_score(m):
               cvss = m.get("vulnerability", {}).get("cvss", [])
               return cvss[0].get("metrics", {}).get("baseScore", 0) if cvss else 0
 
-          # ── Load data ────────────────────────────────────────────────────
+          def satisfied(s):
+              clean = s.lstrip("✅⚠️❌ ")
+              ok = clean.startswith("Complete")
+              return "✅ Satisfied" if ok else f"⚠️ Partial — {clean}"
+
+          # ── Load data ─────────────────────────────────────────────────────
           grype      = load_json("grype-results.json")
           sbom       = load_json("sbom-spdx.json")
           semgrep    = load_json("semgrep-results.json")
@@ -979,10 +1025,9 @@ jobs:
           semgrep_st = load_json("semgrep-status.json")
           extraction = load_json("extraction-summary.json")
 
-          # ── Counts ───────────────────────────────────────────────────────
+          # ── Counts ────────────────────────────────────────────────────────
           matches    = grype.get("matches", [])
-          sev_order  = ["Critical", "High", "Medium", "Low", "Negligible"]
-          sev_counts = {s: 0 for s in sev_order}
+          sev_counts = {s: 0 for s in SEV_ORDER}
           kev_count  = 0
 
           for m in matches:
@@ -996,11 +1041,10 @@ jobs:
           pkg_count    = len(sbom.get("packages", []))
           sast_results = semgrep.get("results", [])
           sast_count   = len(sast_results)
-
           zip_found    = len(extraction.get("zip_files_found", []))
           zip_ext      = len(extraction.get("zip_files_extracted", []))
 
-          # ── Env vars ─────────────────────────────────────────────────────
+          # ── Env vars ──────────────────────────────────────────────────────
           repo      = os.environ.get("GITHUB_REPOSITORY", "unknown")
           run_num   = os.environ.get("GITHUB_RUN_NUMBER", "?")
           ref_name  = os.environ.get("GITHUB_REF_NAME", "?")
@@ -1008,47 +1052,67 @@ jobs:
           event     = os.environ.get("GITHUB_EVENT_NAME", "?")
           scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+          # ── KEV risk banner ───────────────────────────────────────────────
+          # Shown only when one or more findings are in CISA KEV
+          kev_banner = (
+              "\n> 🔴 **ACTIVE EXPLOITATION CONFIRMED** — "
+              f"{kev_count} finding(s) appear in the CISA Known Exploited "
+              "Vulnerabilities catalog. Prioritize remediation immediately.\n"
+              if kev_count > 0
+              else ""
+          )
+
           L = []
 
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           # HEADER
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           L += [
               "# Open Source Software (OSS) Security Scanner",
               "",
-              f"**Author:** Hector L. Bones  ",
-              f"**Scan Date:** {scan_date}  ",
-              f"**Scanner Version:** v2.4 (Syft · Grype · Snyk · Semgrep · CodeQL)  ",
-              f"**Classification:** UNCLASSIFIED",
+              "| Field | Value |",
+              "|---|---|",
+              "| **Tool** | Open Source Software (OSS) Security Scanner |",
+              "| **Version** | v2.5 (Fork Edition) |",
+              "| **Author** | Hector L. Bones |",
+              "| **Scan Date** | " + scan_date + " |",
+              "| **Scanners** | Syft · Grype · Snyk · Semgrep · CodeQL |",
+              "| **Classification** | UNCLASSIFIED |",
               "",
           ]
 
-          # ════════════════════════════════════════════════════════════════
+          if kev_banner:
+              L.append(kev_banner)
+
+          # ══════════════════════════════════════════════════════════════════
           # SECTION 1 — FINDINGS SUMMARY
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           L += [
               "---",
               "",
               "## Findings Summary",
               "",
-              "| Metric | Value |",
+              "| Severity | Count |",
               "|---|---|",
           ]
-          for sev in sev_order:
-              if sev_counts[sev] > 0:
-                  L.append(f"| {sev} Vulnerabilities | {sev_counts[sev]} |")
+
+          for sev in SEV_ORDER:
+              count = sev_counts[sev]
+              if count > 0:
+                  L.append(f"| {sev_display(sev)} | {count} |")
+
           L += [
               f"| **Total Vulnerabilities** | **{total_vulns}** |",
-              f"| In CISA KEV | {kev_count} |",
+              f"| 🔴 In CISA KEV | {kev_count} |",
               f"| SBOM Packages Inventoried | {pkg_count} |",
               f"| SAST Findings | {sast_count} |",
               f"| ZIP Files Extracted | {zip_ext} of {zip_found} |",
               "",
           ]
 
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           # SECTION 2 — SCAN IDENTITY
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           L += [
               "---",
               "",
@@ -1066,15 +1130,12 @@ jobs:
               "",
           ]
 
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           # SECTION 3 — COMPLIANCE CONTROLS
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           semgrep_s = tool_status(semgrep_st)
           grype_s   = tool_status(grype_st)
           syft_s    = tool_status(syft_st)
-
-          def satisfied(s):
-              return "Satisfied" if s in ("Complete", "Vulnerabilities found") else f"Partial — {s}"
 
           L += [
               "---",
@@ -1086,18 +1147,18 @@ jobs:
               f"| APSC-DV-002560 — SAST Execution | DISA ASD STIG v5 | Semgrep | {satisfied(semgrep_s)} |",
               f"| APSC-DV-003235 — Dependency Scanning | DISA ASD STIG v5 | Grype + Snyk | {satisfied(grype_s)} |",
               f"| SA-11 — Developer Testing | NIST SP 800-53 Rev 5 | Semgrep | {satisfied(semgrep_s)} |",
-               "| SA-15 — Development Process | NIST SP 800-53 Rev 5 | Workflow logs + commit history | Satisfied |",
+               "| SA-15 — Development Process | NIST SP 800-53 Rev 5 | Workflow logs + commit history | ✅ Satisfied |",
               f"| RA-5 — Vulnerability Monitoring | NIST SP 800-53 Rev 5 | Grype + Snyk | {satisfied(grype_s)} |",
               f"| SR-3 — Supply Chain Protection | NIST SP 800-53 Rev 5 | Syft | {satisfied(syft_s)} |",
               f"| SR-4 — Provenance Tracking | NIST SP 800-53 Rev 5 | Syft (PURL/CPE) | {satisfied(syft_s)} |",
               f"| NTIA SBOM Minimum Elements | SBOM Federal Mandate | Syft | {satisfied(syft_s)} |",
-               "| DoDI 8510.01 — Audit Trail | DoD Policy | GitHub Release | Satisfied |",
+               "| DoDI 8510.01 — Audit Trail | DoD Policy | GitHub Release | ✅ Satisfied |",
               "",
           ]
 
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           # SECTION 4 — VULNERABILITY FINDINGS TABLE
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           L += [
               "---",
               "",
@@ -1107,29 +1168,38 @@ jobs:
 
           if matches:
               sorted_matches = sorted(matches, key=cvss_score, reverse=True)
+
               L += [
                   "| ID | Severity | CVSS | Package | Version | Fix Available | KEV |",
                   "|---|---|---|---|---|---|---|",
               ]
+
               for m in sorted_matches:
                   vuln     = m.get("vulnerability", {})
                   art      = m.get("artifact", {})
                   fix      = vuln.get("fix", {})
+
                   vuln_id  = vuln.get("id", "?")
-                  sev      = vuln.get("severity", "?")
+                  raw_sev  = vuln.get("severity", "Unknown")
                   score    = cvss_score(m) or "N/A"
                   pkg_name = art.get("name", "?")
                   pkg_ver  = art.get("version", "?")
-                  fix_ver  = (", ".join(fix.get("versions", []))
-                              if fix.get("versions") else fix.get("state", "Unknown"))
-                  kev_flag = "**YES**" if vuln.get("kev", False) else "No"
+                  fix_ver  = (
+                      ", ".join(fix.get("versions", []))
+                      if fix.get("versions")
+                      else fix.get("state", "Unknown")
+                  )
+                  kev_flag = "🔴 **YES**" if vuln.get("kev", False) else "🟢 No"
+
                   L.append(
-                      f"| {vuln_id} | {sev} | {score} | "
+                      f"| {vuln_id} | {sev_display(raw_sev)} | {score} | "
                       f"`{pkg_name}` | {pkg_ver} | {fix_ver} | {kev_flag} |"
                   )
+
               L.append("")
+
           else:
-              L += ["No vulnerabilities identified by Grype.", ""]
+              L += ["🟢 No vulnerabilities identified by Grype.", ""]
 
           # SAST findings
           if sast_results:
@@ -1141,27 +1211,29 @@ jobs:
               ]
               cap = 25
               for r in sast_results[:cap]:
-                  rule = r.get("check_id", "?").split(".")[-1]
-                  path = r.get("path", "?")
-                  line = r.get("start", {}).get("line", "?")
-                  sev  = r.get("extra", {}).get("severity", "?")
-                  L.append(f"| {rule} | `{path}` | {line} | {sev} |")
+                  rule    = r.get("check_id", "?").split(".")[-1]
+                  path    = r.get("path", "?")
+                  line    = r.get("start", {}).get("line", "?")
+                  raw_sev = r.get("extra", {}).get("severity", "UNKNOWN").title()
+                  L.append(f"| {rule} | `{path}` | {line} | {sev_display(raw_sev)} |")
+
               if len(sast_results) > cap:
                   L.append(
                       f"| *...and {len(sast_results) - cap} more — "
-                      f"see semgrep-results.json* | | | |"
+                      "see semgrep-results.json* | | | |"
                   )
               L.append("")
-          else:
-              L += ["### SAST Findings", "", "No SAST findings identified.", ""]
 
-          # ════════════════════════════════════════════════════════════════
+          else:
+              L += ["### SAST Findings", "", "🟢 No SAST findings identified.", ""]
+
+          # ══════════════════════════════════════════════════════════════════
           # SECTION 5 — TOOL EXECUTION STATUS
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           snyk_ec = snyk_st.get("all_projects_exit_code", "?")
           try:
               snyk_note = (
-                  "No package manifests found — Grype provided SCA coverage"
+                  "⚠️ No package manifests found — Grype provided SCA coverage"
                   if int(snyk_ec) == 3
                   else tool_status({"scan_exit_code": snyk_ec})
               )
@@ -1176,33 +1248,56 @@ jobs:
               "| Tool | Purpose | Status |",
               "|---|---|---|",
               f"| Syft | SPDX 2.3 SBOM Generation | {tool_status(syft_st)} |",
-              f"| Grype | SCA Vulnerability Matching (CVSS · EPSS · KEV) | {tool_status(grype_st)} |",
-              f"| Snyk | Manifest-Based Dependency Scanning | {snyk_note} |",
-              f"| Semgrep | Static Application Security Testing (p/ci) | {tool_status(semgrep_st)} |",
-               "| CodeQL | Semantic Code Analysis | Results in Security tab |",
+              f"| Grype | SCA — CVSS · EPSS · KEV matching | {tool_status(grype_st)} |",
+              f"| Snyk | Manifest-based dependency scanning | {snyk_note} |",
+              f"| Semgrep | SAST — p/ci ruleset | {tool_status(semgrep_st)} |",
+               "| CodeQL | Semantic code analysis | Results in Security tab |",
               "",
           ]
 
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           # SECTION 6 — ATTACHED FILES
-          # ════════════════════════════════════════════════════════════════
+          # ══════════════════════════════════════════════════════════════════
           L += [
               "---",
               "",
               "## Attached Files",
               "",
+              "### Formatted Reports",
+              "",
+              "| File | Format | Audience |",
+              "|---|---|---|",
+              "| `developer-report.docx` | Word | Developer / Security Engineer |",
+              "| `developer-report.html` | HTML (self-contained) | Developer / Security Engineer |",
+              "| `developer-report.md` | Markdown | Developer / Security Engineer |",
+              "| `analyst-report.docx` | Word | Security Analyst / ISSO |",
+              "| `analyst-report.html` | HTML (self-contained) | Security Analyst / ISSO |",
+              "| `analyst-report.md` | Markdown | Security Analyst / ISSO |",
+              "| `leadership-report.docx` | Word | Authorizing Official / PM |",
+              "| `leadership-report.html` | HTML (self-contained) | Authorizing Official / PM |",
+              "| `leadership-report.md` | Markdown | Authorizing Official / PM |",
+              "",
+              "### Raw Evidence",
+              "",
               "| File | Contents |",
               "|---|---|",
-              "| `sbom-spdx.json` | SPDX 2.3 Software Bill of Materials — all packages with PURL and CPE |",
+              "| `sbom-spdx.json` | SPDX 2.3 SBOM — all packages with PURL and CPE |",
               "| `grype-results.json` | Vulnerability findings — CVSS v3.1, EPSS scores, CISA KEV flags |",
               "| `snyk-results.json` | Snyk manifest-based dependency scan results |",
               "| `semgrep-results.json` | Static analysis findings — Semgrep p/ci ruleset |",
               "| `Security-Scan-Report-Latest.md` | Human-readable summary of this scan run |",
-              f"| `security-scan-reports-{run_num}.zip` | Complete audit archive — all reports and raw evidence |",
+              "| `REFERENCES.md` | Authoritative sources for all metrics and standards |",
+              "| `COMPLIANCE-OVERVIEW.md` | Program explanation for auditors |",
+              "",
+              "### Archive",
+              "",
+              "| File | Contents |",
+              "|---|---|",
+              f"| `security-scan-reports-{run_num}.zip` | Complete audit archive — all reports and evidence |",
               "",
               "---",
               "",
-              f"*Open Source Software (OSS) Security Scanner v2.4 \\| "
+              f"*Open Source Software (OSS) Security Scanner v2.5 (Fork Edition) \\| "
               f"Author: Hector L. Bones \\| {scan_date} \\| UNCLASSIFIED*",
           ]
 

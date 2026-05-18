@@ -1,8 +1,8 @@
 ################################################################################
 # Open Source Software (OSS) Security Scanner - CodeQL SAST Workflow
 # Author: Hector L. Bones
-# Version: 1.0
-# Last Updated: 2026-05-09
+# Version: 1.1
+# Last Updated: 2026-05-11
 #
 # Purpose:
 # - Run CodeQL semantic code analysis against extracted customer software
@@ -10,9 +10,9 @@
 # - Attach SARIF results to the GitHub Release created by scan.yml
 #
 # Design notes:
-# - Triggered by workflow_run on "Open Source Software (OSS) Security Scanner" success.
-#   This guarantees the release already exists before we try to attach to it,
-#   eliminating any race condition with scan.yml.
+# - Triggered by workflow_run on "Open Source Software (OSS) Security Scanner"
+#   success. This guarantees the release already exists before we try to
+#   attach to it, eliminating any race condition with scan.yml.
 # - Languages are auto-detected from file extensions inside the customer ZIP.
 #   CodeQL runs as a matrix — one job per detected language in parallel.
 # - build-mode: none is used for all languages. This is reliable across
@@ -22,7 +22,7 @@
 #   that language to improve results.
 # - SARIF files are uploaded to the GitHub Security tab automatically by the
 #   codeql-action/analyze step, and also attached as files to the latest
-#   GitHub Release for inclusion in the security audit archive.
+#   GitHub Release for inclusion in the OSS security audit archive.
 #
 # Supported languages (auto-detected):
 #   python, javascript/typescript, java/kotlin, c#, go, ruby, c/c++
